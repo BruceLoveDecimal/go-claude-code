@@ -1,6 +1,6 @@
 # go-claude-go
 
-基于 [Claude Code](https://github.com/anthropics/claude-code) 泄露的 TypeScript 源码逆向重写的 Go 核心引擎。
+基于 Claude Code泄露的 TypeScript 源码逆向重写的 Go 核心引擎。
 
 **27 个 Go 源文件 · 约 4,700 行代码 · 单二进制 · 零 Node.js 依赖**
 
