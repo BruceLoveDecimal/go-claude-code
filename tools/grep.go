@@ -67,14 +67,6 @@ func (t *GrepTool) Call(
 		return ToolResult{IsError: true, Data: "pattern is required"}, nil
 	}
 
-	perm, err := canUse(t.Name(), input, ctx)
-	if err != nil {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("permission error: %v", err)}, nil
-	}
-	if perm.Behavior == PermBlock {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("blocked: %s", perm.Reason)}, nil
-	}
-
 	// Build regex
 	flags := ""
 	if v, ok := input["-i"].(bool); ok && v {
@@ -108,8 +100,11 @@ func (t *GrepTool) Call(
 		}
 		// Apply glob filter
 		if globPattern != "" {
-			matched, err := filepath.Match(globPattern, d.Name())
-			if err != nil || !matched {
+			relPath := d.Name()
+			if rel, relErr := filepath.Rel(searchPath, path); relErr == nil {
+				relPath = rel
+			}
+			if !matchGlobPath(globPattern, relPath) {
 				return nil
 			}
 		}

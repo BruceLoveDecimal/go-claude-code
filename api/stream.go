@@ -22,6 +22,14 @@ type sseEvent struct {
 	Message *sseMessage `json:"message,omitempty"`
 	// content_block_start
 	ContentBlock *sseContentBlock `json:"content_block,omitempty"`
+	// error event
+	Error *sseErrorBody `json:"error,omitempty"`
+}
+
+// sseErrorBody is the "error" field inside an SSE error event.
+type sseErrorBody struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 type sseDelta struct {

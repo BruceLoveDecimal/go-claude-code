@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/claude-code/go-claude-go/query"
+	"github.com/claude-code/go-claude-go/tools"
 	"github.com/claude-code/go-claude-go/types"
 )
 
@@ -24,8 +25,8 @@ import (
 func (qe *QueryEngine) SubmitMessage(
 	ctx context.Context,
 	prompt string,
-) (<-chan types.Message, <-chan error) {
-	msgCh := make(chan types.Message, 64)
+) (<-chan types.SDKMessage, <-chan error) {
+	msgCh := make(chan types.SDKMessage, 64)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -47,23 +48,47 @@ func (qe *QueryEngine) SubmitMessage(
 		msgCh <- userMsg
 
 		// Set up the outgoing channel for the query loop.
-		loopOutCh := make(chan types.Message, 64)
+		loopOutCh := make(chan types.SDKMessage, 64)
 		loopErrCh := make(chan error, 1)
 
 		go func() {
 			defer close(loopOutCh)
 			defer close(loopErrCh)
 
+			// Wrap CanUseTool to record permission denials at the session level.
+			wrappedCanUse := func(
+				toolName string,
+				input map[string]interface{},
+				ctx tools.ToolContext,
+			) (tools.PermissionResult, error) {
+				result, err := qe.config.CanUseTool(toolName, input, ctx)
+				if err == nil && result.Behavior == tools.PermBlock {
+					reason := result.Reason
+					if reason == "" {
+						reason = "permission denied"
+					}
+					qe.recordDenial(toolName, reason)
+				}
+				return result, err
+			}
+
 			params := query.QueryParams{
-				Messages:     snapshot,
-				SystemPrompt: qe.buildSystemPrompt(),
-				APIClient:    qe.apiClient,
-				Registry:     qe.config.Registry,
-				CanUseTool:   qe.config.CanUseTool,
-				WorkingDir:   qe.config.CWD,
-				Model:        qe.config.Model,
-				MaxTurns:     qe.config.MaxTurns,
-				AutoCompact:  qe.config.AutoCompact,
+				Messages:                snapshot,
+				SystemPrompt:            qe.buildSystemPrompt(),
+				APIClient:               qe.apiClient,
+				Registry:                qe.config.Registry,
+				CanUseTool:              wrappedCanUse,
+				WorkingDir:              qe.config.CWD,
+				Model:                   qe.config.Model,
+				FallbackModel:           qe.config.FallbackModel,
+				MaxTurns:                qe.config.MaxTurns,
+				Verbose:                 qe.config.Verbose,
+				AutoCompact:             qe.config.AutoCompact,
+				// Phase 1: wire session-level state into the query loop.
+				GetAppState:             qe.GetAppState,
+				SetAppState:             qe.SetAppState,
+				ReadFileState:           qe.readFileState,
+				ContentReplacementState: qe.contentReplState,
 			}
 
 			terminal, err := query.Query(ctx, params, loopOutCh)

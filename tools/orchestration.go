@@ -68,8 +68,13 @@ func partitionByConcurrency(
 // ─────────────────────────────────────────────────────────────────────────────
 
 // RunTools executes all tool_use blocks from an assistant turn and returns the
-// corresponding tool_result UserMessages.  It mirrors the TypeScript
-// runTools() generator in src/query.ts.
+// corresponding tool_result UserMessages plus any side-channel messages
+// injected by tools (via ToolResult.NewMessages).
+//
+// toolResults are the tool_result UserMessages that MUST go into the
+// conversation history.  sideMessages are informational (confirmations,
+// progress notes) and should be emitted to the output channel but NOT added
+// to the API conversation history.
 //
 // Concurrency policy:
 //   - Blocks that are read-only / concurrent-safe are dispatched as a batch
@@ -79,33 +84,36 @@ func RunTools(
 	blocks     []*types.ToolUseBlock,
 	canUse     CanUseToolFn,
 	toolCtx    ToolContext,
-) ([]types.Message, error) {
+) (toolResults []types.Message, sideMessages []types.Message, err error) {
 	if len(blocks) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	registry := toolCtx.Registry
 	batches := partitionByConcurrency(blocks, registry)
 
-	var results []types.Message
 	for _, batch := range batches {
 		if batch.concurrent {
-			msgs, err := runConcurrently(batch.blocks, canUse, toolCtx)
-			if err != nil {
-				return nil, err
+			results, sides, batchErr := runConcurrently(batch.blocks, canUse, toolCtx)
+			if batchErr != nil {
+				return nil, nil, batchErr
 			}
-			results = append(results, msgs...)
+			toolResults = append(toolResults, results...)
+			sideMessages = append(sideMessages, sides...)
 		} else {
 			for _, block := range batch.blocks {
-				msg, err := runSingleTool(block, canUse, toolCtx)
-				if err != nil {
-					return nil, err
+				msgs, singleErr := runSingleTool(block, canUse, toolCtx)
+				if singleErr != nil {
+					return nil, nil, singleErr
 				}
-				results = append(results, msg)
+				if len(msgs) > 0 {
+					toolResults = append(toolResults, msgs[0])
+					sideMessages = append(sideMessages, msgs[1:]...)
+				}
 			}
 		}
 	}
-	return results, nil
+	return toolResults, sideMessages, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,7 +122,7 @@ func RunTools(
 
 type indexedResult struct {
 	index int
-	msg   types.Message
+	msgs  []types.Message // [0] = tool_result, [1:] = side messages
 	err   error
 }
 
@@ -122,8 +130,8 @@ func runConcurrently(
 	blocks  []*types.ToolUseBlock,
 	canUse  CanUseToolFn,
 	toolCtx ToolContext,
-) ([]types.Message, error) {
-	out := make([]types.Message, len(blocks))
+) (toolResults []types.Message, sideMessages []types.Message, err error) {
+	out := make([][]types.Message, len(blocks))
 	ch := make(chan indexedResult, len(blocks))
 	var wg sync.WaitGroup
 
@@ -131,8 +139,8 @@ func runConcurrently(
 		wg.Add(1)
 		go func(idx int, b *types.ToolUseBlock) {
 			defer wg.Done()
-			msg, err := runSingleTool(b, canUse, toolCtx)
-			ch <- indexedResult{index: idx, msg: msg, err: err}
+			msgs, runErr := runSingleTool(b, canUse, toolCtx)
+			ch <- indexedResult{index: idx, msgs: msgs, err: runErr}
 		}(i, block)
 	}
 
@@ -141,45 +149,54 @@ func runConcurrently(
 
 	for res := range ch {
 		if res.err != nil {
-			return nil, res.err
+			return nil, nil, res.err
 		}
-		out[res.index] = res.msg
+		out[res.index] = res.msgs
 	}
-	return out, nil
+
+	for _, msgs := range out {
+		if len(msgs) > 0 {
+			toolResults = append(toolResults, msgs[0])
+			sideMessages = append(sideMessages, msgs[1:]...)
+		}
+	}
+	return toolResults, sideMessages, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Single tool execution
 // ─────────────────────────────────────────────────────────────────────────────
 
+// runSingleTool returns a slice where [0] is the tool_result message and
+// [1:] are any side-channel messages from ToolResult.NewMessages.
 func runSingleTool(
 	block   *types.ToolUseBlock,
 	canUse  CanUseToolFn,
 	toolCtx ToolContext,
-) (types.Message, error) {
+) ([]types.Message, error) {
 	registry := toolCtx.Registry
 
 	tool, ok := registry.Get(block.Name)
 	if !ok {
-		return makeErrorResult(block.ID, fmt.Sprintf("unknown tool: %s", block.Name)), nil
+		return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("unknown tool: %s", block.Name))}, nil
 	}
 
 	input, err := block.InputMap()
 	if err != nil {
-		return makeErrorResult(block.ID, fmt.Sprintf("invalid tool input: %v", err)), nil
+		return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("invalid tool input: %v", err))}, nil
 	}
 
 	// Permission check
 	perm, err := canUse(tool.Name(), input, toolCtx)
 	if err != nil {
-		return makeErrorResult(block.ID, fmt.Sprintf("permission error: %v", err)), nil
+		return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("permission error: %v", err))}, nil
 	}
 	if perm.Behavior == PermBlock {
 		reason := perm.Reason
 		if reason == "" {
 			reason = "permission denied"
 		}
-		return makeErrorResult(block.ID, reason), nil
+		return []types.Message{makeErrorResult(block.ID, reason)}, nil
 	}
 	// Use potentially updated input from permission handler
 	if perm.UpdatedInput != nil {
@@ -189,10 +206,12 @@ func runSingleTool(
 	// Execute
 	result, err := tool.Call(input, toolCtx, canUse, nil)
 	if err != nil {
-		return makeErrorResult(block.ID, fmt.Sprintf("tool error: %v", err)), nil
+		return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("tool error: %v", err))}, nil
 	}
 
-	return makeToolResultMessage(block.ID, result), nil
+	msgs := []types.Message{makeToolResultMessage(block.ID, result)}
+	msgs = append(msgs, result.NewMessages...)
+	return msgs, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

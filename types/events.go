@@ -25,6 +25,6 @@ type StreamDeltaEvent struct {
 }
 
 // SDKMessage is the union of everything that SubmitMessage can yield to callers.
-// In Go we use interface{} since there's no algebraic type; callers switch on
-// concrete type.
-type SDKMessage = Message
+// In Go we use an empty interface so the stream can carry both persistent
+// conversation messages and transient SDK events like deltas/request markers.
+type SDKMessage interface{}

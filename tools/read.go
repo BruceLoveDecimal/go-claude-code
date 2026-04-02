@@ -60,14 +60,6 @@ func (t *ReadTool) Call(
 		return ToolResult{IsError: true, Data: "file_path is required"}, nil
 	}
 
-	perm, err := canUse(t.Name(), input, ctx)
-	if err != nil {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("permission error: %v", err)}, nil
-	}
-	if perm.Behavior == PermBlock {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("blocked: %s", perm.Reason)}, nil
-	}
-
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ToolResult{IsError: true, Data: fmt.Sprintf("read error: %v", err)}, nil
