@@ -69,8 +69,25 @@ func main() {
 }
 
 // printMessage renders a single message to stdout in a human-readable format.
-func printMessage(msg types.Message) {
+func printMessage(msg types.SDKMessage) {
 	switch m := msg.(type) {
+	case *types.RequestStartEvent:
+		fmt.Printf("\n[%s]\n", m.Type)
+
+	case *types.StreamDeltaEvent:
+		switch m.DeltaType {
+		case "text_delta":
+			fmt.Print(m.Text)
+		case "thinking_delta":
+			if m.Thinking != "" {
+				fmt.Printf("\n[thinking_delta] %s\n", m.Thinking)
+			}
+		case "input_json_delta":
+			if m.InputJSON != "" {
+				fmt.Printf("\n[input_json_delta] %s\n", m.InputJSON)
+			}
+		}
+
 	case *types.UserMessage:
 		if m.IsMeta || m.IsVirtual {
 			return

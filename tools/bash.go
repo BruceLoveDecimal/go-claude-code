@@ -71,15 +71,6 @@ func (t *BashTool) Call(
 		return ToolResult{IsError: true, Data: "command is required"}, nil
 	}
 
-	// Permission check
-	perm, err := canUse(t.Name(), input, ctx)
-	if err != nil {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("permission error: %v", err)}, nil
-	}
-	if perm.Behavior == PermBlock {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("blocked: %s", perm.Reason)}, nil
-	}
-
 	// Build timeout
 	timeoutMs := 120_000
 	if v, ok := input["timeout"].(float64); ok && v > 0 {

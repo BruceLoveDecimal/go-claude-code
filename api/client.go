@@ -147,10 +147,24 @@ func doStream(
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return &types.APIError{
+		apiErr := &types.APIError{
 			Status:  resp.StatusCode,
 			Message: string(body),
 		}
+		// Try to extract error type from JSON response body.
+		var errBody struct {
+			Error struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &errBody) == nil && errBody.Error.Type != "" {
+			apiErr.ErrType = errBody.Error.Type
+			if errBody.Error.Message != "" {
+				apiErr.Message = errBody.Error.Message
+			}
+		}
+		return apiErr
 	}
 
 	return parseSSEStream(resp.Body, out)
@@ -201,6 +215,15 @@ func dispatchSSEData(data string, assembler *streamAssembler, out chan<- interfa
 	var ev sseEvent
 	if err := json.Unmarshal([]byte(data), &ev); err != nil {
 		return nil // ignore malformed events
+	}
+
+	// Handle SSE-level error events (e.g. overloaded_error).
+	if ev.Type == "error" && ev.Error != nil {
+		return &types.APIError{
+			Status:  529,
+			Message: ev.Error.Message,
+			ErrType: ev.Error.Type,
+		}
 	}
 
 	delta, complete := assembler.applyEvent(ev)

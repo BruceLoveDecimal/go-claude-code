@@ -162,10 +162,19 @@ type APIError struct {
 	Status  int         `json:"status"`
 	Message string      `json:"message"`
 	Body    interface{} `json:"body,omitempty"`
+	// ErrType is the Anthropic error type (e.g. "overloaded_error") when
+	// available from the response body or an SSE error event.
+	ErrType string `json:"error_type,omitempty"`
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("anthropic API error %d: %s", e.Status, e.Message)
+}
+
+// IsOverloaded reports whether this error indicates the model is overloaded
+// (HTTP 529 or SSE overloaded_error event).
+func (e *APIError) IsOverloaded() bool {
+	return e.Status == 529 || e.ErrType == "overloaded_error"
 }
 
 // AssistantMessage wraps a single model response.

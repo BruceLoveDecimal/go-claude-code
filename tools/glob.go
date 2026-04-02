@@ -1,8 +1,11 @@
 package tools
 
 import (
+	"io/fs"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -56,35 +59,74 @@ func (t *GlobTool) Call(
 		return ToolResult{IsError: true, Data: "pattern is required"}, nil
 	}
 
-	perm, err := canUse(t.Name(), input, ctx)
-	if err != nil {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("permission error: %v", err)}, nil
-	}
-	if perm.Behavior == PermBlock {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("blocked: %s", perm.Reason)}, nil
-	}
-
 	baseDir := ctx.WorkingDir
 	if v, ok := input["path"].(string); ok && v != "" {
 		baseDir = v
 	}
 
-	// Build the full pattern
-	fullPattern := pattern
-	if baseDir != "" && !filepath.IsAbs(pattern) {
-		fullPattern = filepath.Join(baseDir, pattern)
+	searchRoot := baseDir
+	matchPattern := filepath.ToSlash(pattern)
+	if filepath.IsAbs(pattern) {
+		searchRoot = string(filepath.Separator)
+	}
+	if searchRoot == "" {
+		searchRoot = "."
 	}
 
-	matches, err := filepath.Glob(fullPattern)
-	if err != nil {
-		return ToolResult{IsError: true, Data: fmt.Sprintf("glob error: %v", err)}, nil
+	type match struct {
+		path    string
+		modTime int64
+	}
+	var matches []match
+	walkErr := filepath.WalkDir(searchRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		target := filepath.ToSlash(path)
+		if !filepath.IsAbs(pattern) {
+			rel, relErr := filepath.Rel(searchRoot, path)
+			if relErr != nil {
+				return nil
+			}
+			target = filepath.ToSlash(rel)
+		}
+		if !matchGlobPath(matchPattern, target) {
+			return nil
+		}
+		info, infoErr := os.Stat(path)
+		if infoErr != nil {
+			return nil
+		}
+		matches = append(matches, match{
+			path:    path,
+			modTime: info.ModTime().UnixNano(),
+		})
+		return nil
+	})
+	if walkErr != nil {
+		return ToolResult{IsError: true, Data: fmt.Sprintf("glob error: %v", walkErr)}, nil
 	}
 
 	if len(matches) == 0 {
 		return ToolResult{Data: "No files matched."}, nil
 	}
 
-	result := strings.Join(matches, "\n")
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].modTime == matches[j].modTime {
+			return matches[i].path < matches[j].path
+		}
+		return matches[i].modTime > matches[j].modTime
+	})
+
+	paths := make([]string, 0, len(matches))
+	for _, m := range matches {
+		paths = append(paths, m.path)
+	}
+
+	result := strings.Join(paths, "\n")
 	if len(result) > globMaxResultChars {
 		result = result[:globMaxResultChars] + "\n[output truncated]"
 	}

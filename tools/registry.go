@@ -1,6 +1,9 @@
 package tools
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+)
 
 // Registry maps tool names to their Tool implementations.
 type Registry struct {
@@ -35,6 +38,9 @@ func (r *Registry) All() []Tool {
 	for _, t := range r.tools {
 		out = append(out, t)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name() < out[j].Name()
+	})
 	return out
 }
 
@@ -46,6 +52,9 @@ func (r *Registry) Enabled() []Tool {
 			out = append(out, t)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Name() < out[j].Name()
+	})
 	return out
 }
 

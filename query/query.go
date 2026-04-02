@@ -5,6 +5,7 @@ import (
 
 	"github.com/claude-code/go-claude-go/api"
 	"github.com/claude-code/go-claude-go/compact"
+	"github.com/claude-code/go-claude-go/hooks"
 	"github.com/claude-code/go-claude-go/tools"
 	"github.com/claude-code/go-claude-go/types"
 )
@@ -38,11 +39,43 @@ type QueryParams struct {
 	// Model is the Anthropic model ID (e.g. "claude-sonnet-4-6").
 	Model string
 
+	// FallbackModel is used if the primary model returns an overloaded error.
+	// Empty string disables fallback (Phase 3).
+	FallbackModel string
+
 	// MaxTurns is the upper bound on tool-execution rounds.  0 = unlimited.
 	MaxTurns int
 
+	// Verbose enables additional diagnostic output forwarded to ToolContext.
+	Verbose bool
+
 	// AutoCompact configures context compaction.
 	AutoCompact compact.AutoCompactConfig
+
+	// ── Session-level state (Phase 1) ────────────────────────────────────
+
+	// GetAppState provides read access to the session-level AppState.
+	// If nil, a no-op returning DefaultAppState() is used.
+	GetAppState func() tools.AppState
+
+	// SetAppState applies a transformation to the session-level AppState.
+	// If nil, state updates are silently dropped.
+	SetAppState func(func(tools.AppState) tools.AppState)
+
+	// ReadFileState is the session-scoped file metadata cache.
+	// If nil, tools that need it will skip caching.
+	ReadFileState *tools.ReadFileState
+
+	// ContentReplacementState tracks tool-result truncations.
+	// If nil, budget compaction is disabled (Phase 3).
+	ContentReplacementState *tools.ContentReplacementState
+
+	// ── Stop hooks (Phase 3) ─────────────────────────────────────────────
+
+	// StopHooks are invoked after each API response that contains no tool_use
+	// blocks.  If any hook returns ShouldRetry=true, the loop performs one
+	// additional API round-trip.
+	StopHooks []hooks.StopHookFn
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -58,7 +91,21 @@ type QueryParams struct {
 func Query(
 	ctx context.Context,
 	params QueryParams,
-	outCh chan<- types.Message,
+	outCh chan<- types.SDKMessage,
 ) (types.Terminal, error) {
+	// Fill in nil callbacks with safe no-op defaults so the loop and tools
+	// never need to nil-check these.
+	if params.GetAppState == nil {
+		params.GetAppState = func() tools.AppState { return tools.DefaultAppState() }
+	}
+	if params.SetAppState == nil {
+		params.SetAppState = func(func(tools.AppState) tools.AppState) {}
+	}
+	if params.ReadFileState == nil {
+		params.ReadFileState = tools.NewReadFileState()
+	}
+	if params.ContentReplacementState == nil {
+		params.ContentReplacementState = tools.NewContentReplacementState()
+	}
 	return queryLoop(ctx, params, outCh)
 }
