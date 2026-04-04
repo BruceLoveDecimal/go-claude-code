@@ -1,7 +1,6 @@
 # go-claude-go
 
-基于 [Claude Code](https://github.com/anthropics/claude-code) 核心引擎的 Go Agent SDK。这不是 CLI 克隆——而是供 Go 开发者构建自己 Agent 应用的库。
-
+基于 Claude Code逆向代码为核心引擎的 Go Agent SDK。
 **约 35 个 Go 源文件 · 约 6,000 行代码 · 单二进制 · 零 Node.js 依赖**
 
 ## 这是什么
