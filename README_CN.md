@@ -1,12 +1,26 @@
 # go-claude-go
 
-基于 [Claude Code](https://github.com/anthropics/claude-code) 泄露的 TypeScript 源码逆向重写的 Go 核心引擎。
+基于 [Claude Code](https://github.com/anthropics/claude-code) 核心引擎的 Go Agent SDK。这不是 CLI 克隆——而是供 Go 开发者构建自己 Agent 应用的库。
 
-**27 个 Go 源文件 · 约 4,700 行代码 · 单二进制 · 零 Node.js 依赖**
+**约 35 个 Go 源文件 · 约 6,000 行代码 · 单二进制 · 零 Node.js 依赖**
+
+## 这是什么
+
+`go-claude-go` 是一个 **Go Agent SDK**，忠实重现了 Claude Code TypeScript 引擎中的代理循环、工具编排、权限系统和上下文管理。SDK 用户编写应用层（CLI、API 服务、CI 流水线、Slack 机器人）——SDK 提供 Agent 大脑。
+
+```go
+qe := engine.NewQueryEngine(engine.QueryEngineConfig{
+    APIKey: "sk-ant-...",
+    Model:  "claude-sonnet-4-6",
+    CWD:    "/path/to/project",
+})
+msgCh, errCh := qe.SubmitMessage(ctx, "修复失败的测试")
+for msg := range msgCh { /* 流式输出给用户 */ }
+```
 
 ## 已实现模块
 
-六大核心模块，忠实映射 TypeScript 架构：
+九大核心模块，忠实映射 TypeScript 架构：
 
 | 模块 | Go 包 | TypeScript 来源 |
 |------|------|----------------|
@@ -16,6 +30,9 @@
 | **权限系统** — 5 步权限决策链 + 交互式 CLI | `tools/permissions/` | `src/hooks/useCanUseTool.tsx` |
 | **上下文管理** — 四层压缩管线 | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
 | **Stop Hooks** — 响应后钩子框架 | `hooks/` | `src/hooks/` |
+| **会话持久化** — JSONL 对话历史 + 恢复 | `session/` | `src/utils/sessionStorage.ts` |
+| **MCP 客户端** — stdio JSON-RPC 2.0 + 动态工具注册 | `mcp/` | `src/services/mcp/` |
+| **Agent / 子代理** — 嵌套代理循环 + 协调器模式 | `engine/agent.go` + `tools/agent.go` | `src/tools/AgentTool/` |
 
 ### 权限系统 (Phase 2)
 
@@ -50,7 +67,7 @@
 | **Stop Hooks** | `StopHookFn` 在终端响应后执行，可触发额外一轮 API 调用 |
 | **权限拒绝追踪** | 每次 `PermBlock` 记录到 `QueryEngine.PermissionDenials()` 审计日志 |
 
-### 内置工具
+### 内置工具（14 个）
 
 | 工具 | 文件 | 描述 |
 |-----|------|------|
@@ -58,10 +75,96 @@
 | **Read** | `tools/read.go` | 读取文件（带行号），支持 `offset` 和 `limit` |
 | **Glob** | `tools/glob.go` | 按 glob 模式匹配文件（支持 `**` 递归） |
 | **Grep** | `tools/grep.go` | 正则表达式搜索文件内容 |
+| **LS** | `tools/ls.go` | 列目录树形结构，支持忽略模式 |
+| **WebFetch** | `tools/webfetch.go` | 获取 URL 内容并提取纯文本 |
+| **Write** | `tools/write.go` | 创建或覆盖文件，更新 ReadFileState 缓存 |
+| **Edit** | `tools/edit.go` | 精确字符串替换，支持 `replace_all` |
+| **MultiEdit** | `tools/multiedit.go` | 单文件内的顺序批量编辑 |
+| **TodoRead** | `tools/todo.go` | 从 AppState 读取会话级任务列表 |
+| **TodoWrite** | `tools/todo.go` | 替换 AppState 中的会话级任务列表 |
+| **Agent** | `tools/agent.go` | 启动独立查询循环的子代理 |
+| **SendMessage** | `tools/agent.go` | 向运行中的子代理发送追加提示 |
+| **MCP 工具** | `tools/mcp_tool.go` | 从 MCP 服务器动态注册 |
 
 ---
 
-## 架构
+## SDK 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        用户应用层                                │
+│  （CLI 应用、API 服务、CI 流水线、Slack 机器人等）                 │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    go-claude-go SDK                              │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                  engine.QueryEngine                      │    │
+│  │                                                         │    │
+│  │  • SubmitMessage(ctx, prompt) → (msgCh, errCh)          │    │
+│  │  • GetAppState / SetAppState                            │    │
+│  │  • Messages() / TotalUsage()                            │    │
+│  │  • SessionID() / 从会话恢复                               │    │
+│  └────────┬──────────────────────┬─────────────────────────┘    │
+│           │                      │                              │
+│     ┌─────▼──────┐        ┌─────▼──────────────┐               │
+│     │ query.Loop │        │ tools.RunTools      │               │
+│     │            │◄──────►│                     │               │
+│     │ • 流式输出  │        │ • 权限检查           │               │
+│     │ • 错误恢复  │        │ • 并发批处理         │               │
+│     │ • 上下文压缩│        │ • 串行调度           │               │
+│     └─────┬──────┘        └────────┬────────────┘               │
+│           │                        │                            │
+│  ┌────────▼────────────────────────▼───────────────────────┐    │
+│  │                  基础设施层                               │    │
+│  │                                                         │    │
+│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐  │    │
+│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │  │    │
+│  │  │          │ │           │ │          │ │          │  │    │
+│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │  │    │
+│  │  │ • Stream │ │ • Micro   │ │ • 加载    │ │          │  │    │
+│  │  │          │ │ • Auto    │ │ • 恢复    │ │          │  │    │
+│  │  │          │ │ • Budget  │ │          │ │          │  │    │
+│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                     工具层                                │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  内置工具（14 个）        │  │  扩展点              │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  Bash Read Glob Grep   │  │  • Tool 接口          │  │    │
+│  │  │  Write Edit MultiEdit  │  │  • Registry.Register  │  │    │
+│  │  │  LS WebFetch Todo×2    │  │  • MCP 自动导入       │  │    │
+│  │  │  Agent SendMessage     │  │  • 自定义 CanUseTool  │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  permissions/           │  │  mcp/                │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  • 5 步决策链            │  │  • StdioMCPClient   │  │    │
+│  │  │  • 规则匹配             │  │  • JSON-RPC 2.0     │  │    │
+│  │  │  • 交互式确认            │  │  • 工具包装器        │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                types/（协议格式）                          │    │
+│  │                                                         │    │
+│  │  Message, ContentBlock, SDKMessage, Usage, APIError      │    │
+│  │  Marshal/Unmarshal（多态 JSON）                           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### SDK 不包含的内容（应用层关注点）
+
+TUI / 终端渲染、slash 命令、IDE 集成、语音输入、遥测、插件系统、设置界面。这些属于你基于 SDK 构建的应用。
+
+### 包结构
 
 ```
 go-claude-go/
@@ -69,28 +172,39 @@ go-claude-go/
 ├── types/
 │   ├── message.go           # 消息联合类型 + APIError（含 IsOverloaded()）
 │   ├── content.go           # ContentBlock 联合类型
-│   └── events.go            # Terminal、StreamDeltaEvent
+│   ├── events.go            # Terminal、StreamDeltaEvent
+│   └── marshal.go           # 多态 JSON 序列化/反序列化
 ├── engine/
-│   ├── engine.go            # QueryEngine + 会话状态 + defaultCanUseTool
-│   └── submit.go            # SubmitMessage() + 权限拒绝追踪
+│   ├── engine.go            # QueryEngine + 会话状态 + MCP 注册
+│   ├── submit.go            # SubmitMessage() + 权限拒绝追踪
+│   └── agent.go             # 子代理运行器（创建子查询循环）
 ├── query/
-│   ├── query.go             # Query() 入口 + QueryParams（含 StopHooks）
+│   ├── query.go             # Query() 入口 + QueryParams
 │   ├── state.go             # State 结构体 + TransitionReason 常量
 │   └── loop.go              # queryLoop() — max_tokens 恢复、fallback、stop hooks
 ├── api/
-│   ├── client.go            # Anthropic HTTP 客户端（SSE）+ 错误类型解析
-│   └── stream.go            # SSE 组装器 + SSE 错误事件处理
+│   ├── client.go            # Anthropic HTTP 客户端（SSE）
+│   └── stream.go            # SSE 组装器 + 错误事件处理
 ├── hooks/
 │   └── stop.go              # StopHookFn 类型定义
+├── mcp/
+│   ├── types.go             # MCPTool、MCPResource、MCPContent、MCPServerConfig
+│   └── client.go            # StdioMCPClient：基于 stdio 的 JSON-RPC 2.0
+├── session/
+│   ├── session.go           # SessionMeta、SessionFilePath、NewSessionID
+│   └── persist.go           # AppendMessages、LoadSession、ListSessions
 ├── tools/
-│   ├── tool.go              # Tool 接口、AppState、PermissionContext、ReadFileState…
+│   ├── tool.go              # Tool 接口、AppState、PermissionContext…
 │   ├── registry.go          # 工具注册表（名称 → Tool）
 │   ├── orchestration.go     # RunTools()：分批调度 + 侧信道消息转发
 │   ├── budgetcompact.go     # ApplyToolResultBudget()：250k 字符上限
-│   ├── globmatch.go         # Glob 转正则引擎（支持 **）
-│   ├── bash.go / read.go / glob.go / grep.go
+│   ├── agent.go             # AgentTool + SendMessageTool
+│   ├── agent_registry.go    # 子代理协调注册表
+│   ├── mcp_tool.go          # MCPToolWrapper：将 MCP 工具适配为 Tool 接口
+│   ├── bash.go / read.go / glob.go / grep.go / ls.go / webfetch.go
+│   ├── write.go / edit.go / multiedit.go / todo.go
 │   ├── permissions/
-│   │   ├── permissions.go   # 5 步决策链（HasPermissionsToUseTool）
+│   │   ├── permissions.go   # 5 步决策链
 │   │   └── interactive.go   # CLI 提示 [y/n/a/N] + 规则回写
 │   └── tools_test.go
 └── compact/
@@ -266,13 +380,47 @@ github.com/google/uuid v1.6.0
 | 工具并发分批 + 侧信道消息 | ✅ 完成 |
 | 工具结果预算压缩 | ✅ 完成 |
 | AutoCompact / MicroCompact / Snip | ✅ 完成 |
-| Bash / Read / Glob / Grep 工具 | ✅ 完成 |
+| Bash / Read / Glob / Grep / LS / WebFetch 工具 | ✅ 完成 |
+| Write / Edit / MultiEdit 工具 | ✅ 完成 |
+| TodoRead / TodoWrite 工具 | ✅ 完成 |
 | SSE 流式解析 + 错误事件处理 | ✅ 完成 |
 | Thinking blocks | ✅ 已解析 + 模型切换时剥离 |
-| Write / Edit / MultiEdit 工具 | 🔲 Phase 4 |
-| 会话持久化（JSONL）| 🔲 Phase 5 |
-| MCP 工具支持（stdio JSON-RPC）| 🔲 Phase 6 |
-| Agent / Coordinator-Worker | 🔲 Phase 7 |
+| 会话持久化（JSONL）+ 恢复 | ✅ 完成 |
+| MCP 客户端（stdio JSON-RPC）+ 工具包装 | ✅ 完成 |
+| Agent / SendMessage + 子代理协调 | ✅ 完成 |
+
+---
+
+## 路线图
+
+SDK 目前已可使用。以下是达到生产级质量的三个优先级层。
+
+### P0 — Agent 行为正确性
+
+| 项目 | 描述 |
+|------|------|
+| **System Prompt 构建器** | 分段构建器：环境检测（OS、shell、CWD、git 分支、日期）、动态工具描述注入、CLAUDE.md 项目指令加载。这是影响最大的缺失模块——没有它模型不知道自己在什么环境下运行。 |
+| **API 重试** | 429/529/5xx 指数退避，可配置 `maxRetries`，含 jitter。没有重试在真实 API 负载下不可用。 |
+| **Bash 安全分类器** | 危险命令模式库（rm -rf、DROP TABLE、git push --force 等），即使在 `bypassPermissions` 模式下也作为安全兜底。 |
+
+### P1 — Agent 交互质量
+
+| 项目 | 描述 |
+|------|------|
+| **Hooks 体系扩展** | `PreToolHook`、`PostToolHook`、`MessageHook`，统一 `HookFn` 接口——SDK 用户在不修改引擎代码的前提下注入审计、过滤或改写逻辑的核心扩展机制。 |
+| **AskUserQuestion 工具** | 通过 `QueryEngineConfig.UserInputFn` 回调。SDK 用户注入自己的 IO 实现（CLI stdin、Web 表单、Slack 机器人等）。没有此工具模型无法主动询问用户。 |
+| **Token 估算 + 预算** | 准确的 token 计数，发请求前预算检查，主动触发 compact 而非等待 413 错误。 |
+| **CLAUDE.md + 项目上下文** | 从 CWD 到 git root 递归搜索 `.claude/CLAUDE.md` 和 `CLAUDE.md`，合并注入 system prompt。 |
+
+### P2 — 生态
+
+| 项目 | 描述 |
+|------|------|
+| **MCP SSE/HTTP transport** | 支持远程 MCP 服务器（GitHub MCP、Slack MCP 等），超越 stdio。 |
+| **流式回调 API** | `QueryEngineConfig.OnMessage func(SDKMessage)` 回调 + `engine.RunSync()` 同步便捷方法。 |
+| **结构化日志** | 集成 `slog.Logger`，全链路可观测性：API 调用、工具执行、权限决策、compact 触发。 |
+| **测试覆盖** | 核心路径单元测试：query loop（mock API）、compact 管线、权限链、会话持久化、MCP 客户端。 |
+| **Go module 发布** | 正式 module 路径、语义化版本、godoc 注释、示例目录。 |
 
 ---
 

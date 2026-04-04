@@ -1,12 +1,26 @@
 # go-claude-go
 
-A Go implementation of the core agent engine from [Claude Code](https://github.com/anthropics/claude-code), reverse-engineered from the leaked TypeScript source.
+A Go Agent SDK modeled on the core engine of [Claude Code](https://github.com/anthropics/claude-code). Not a CLI clone — this is a library for Go developers to build their own agent applications.
 
-**27 Go source files · ~4,700 lines · single binary · zero Node.js dependency**
+**~35 Go source files · ~6,000 lines · single binary · zero Node.js dependency**
+
+## What this is
+
+`go-claude-go` is a **Go Agent SDK** that faithfully reimplements the agentic loop, tool orchestration, permission system, and context management from Claude Code's TypeScript engine. The SDK user writes the application layer (CLI, API server, CI pipeline, Slack bot) — the SDK provides the agent brain.
+
+```go
+qe := engine.NewQueryEngine(engine.QueryEngineConfig{
+    APIKey: "sk-ant-...",
+    Model:  "claude-sonnet-4-6",
+    CWD:    "/path/to/project",
+})
+msgCh, errCh := qe.SubmitMessage(ctx, "Fix the failing test")
+for msg := range msgCh { /* stream to user */ }
+```
 
 ## What this implements
 
-Six core modules, faithfully mirroring the TypeScript architecture:
+Nine core modules, faithfully mirroring the TypeScript architecture:
 
 | Module | Go package | TypeScript source |
 |--------|-----------|-------------------|
@@ -16,6 +30,9 @@ Six core modules, faithfully mirroring the TypeScript architecture:
 | **Permission System** — 5-step permission decision chain + interactive CLI | `tools/permissions/` | `src/hooks/useCanUseTool.tsx` |
 | **Context Management** — four-layer compaction pipeline | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
 | **Stop Hooks** — post-response hook framework | `hooks/` | `src/hooks/` |
+| **Session Persistence** — JSONL conversation history with resume | `session/` | `src/utils/sessionStorage.ts` |
+| **MCP Client** — stdio JSON-RPC 2.0 with dynamic tool registration | `mcp/` | `src/services/mcp/` |
+| **Agent / Subagent** — nested agentic loops with coordinator pattern | `engine/agent.go` + `tools/agent.go` | `src/tools/AgentTool/` |
 
 ### Permission System (Phase 2)
 
@@ -50,7 +67,7 @@ Interactive decisions ("always" / "never") are written back to session rules via
 | **Stop hooks** | `StopHookFn` runs after terminal responses; can trigger one more API round-trip |
 | **Permission denial tracking** | Every `PermBlock` recorded in `QueryEngine.PermissionDenials()` audit log |
 
-### Built-in tools
+### Built-in tools (14)
 
 | Tool | File | Description |
 |------|------|-------------|
@@ -58,10 +75,96 @@ Interactive decisions ("always" / "never") are written back to session rules via
 | **Read** | `tools/read.go` | Reads files with line numbers; supports `offset` and `limit`. |
 | **Glob** | `tools/glob.go` | Finds files matching a glob pattern (supports `**` recursive). |
 | **Grep** | `tools/grep.go` | Searches file contents with a regular expression. |
+| **LS** | `tools/ls.go` | Lists directory contents as a tree; supports ignore patterns. |
+| **WebFetch** | `tools/webfetch.go` | Fetches URLs and extracts plain text from HTML. |
+| **Write** | `tools/write.go` | Creates or overwrites files; updates ReadFileState cache. |
+| **Edit** | `tools/edit.go` | Exact string replacement; supports `replace_all`. |
+| **MultiEdit** | `tools/multiedit.go` | Sequential batch edits in a single file. |
+| **TodoRead** | `tools/todo.go` | Reads session-scoped task list from AppState. |
+| **TodoWrite** | `tools/todo.go` | Replaces session-scoped task list in AppState. |
+| **Agent** | `tools/agent.go` | Spawns a subagent with independent query loop. |
+| **SendMessage** | `tools/agent.go` | Sends a follow-up prompt to a running subagent. |
+| **MCP tools** | `tools/mcp_tool.go` | Dynamically registered from MCP servers. |
 
 ---
 
-## Architecture
+## SDK Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      User Application                           │
+│  (CLI app, API server, CI pipeline, Slack bot, etc.)            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    go-claude-go SDK                              │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                  engine.QueryEngine                      │    │
+│  │                                                         │    │
+│  │  • SubmitMessage(ctx, prompt) → (msgCh, errCh)          │    │
+│  │  • GetAppState / SetAppState                            │    │
+│  │  • Messages() / TotalUsage()                            │    │
+│  │  • SessionID() / Resume from session                    │    │
+│  └────────┬──────────────────────┬─────────────────────────┘    │
+│           │                      │                              │
+│     ┌─────▼──────┐        ┌─────▼──────────────┐               │
+│     │ query.Loop │        │ tools.RunTools      │               │
+│     │            │◄──────►│                     │               │
+│     │ • stream   │        │ • permission check  │               │
+│     │ • recover  │        │ • concurrent batch  │               │
+│     │ • compact  │        │ • serial dispatch   │               │
+│     └─────┬──────┘        └────────┬────────────┘               │
+│           │                        │                            │
+│  ┌────────▼────────────────────────▼───────────────────────┐    │
+│  │              Infrastructure Layer                        │    │
+│  │                                                         │    │
+│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐  │    │
+│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │  │    │
+│  │  │          │ │           │ │          │ │          │  │    │
+│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │  │    │
+│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │          │  │    │
+│  │  │          │ │ • Auto    │ │ • Resume │ │          │  │    │
+│  │  │          │ │ • Budget  │ │          │ │          │  │    │
+│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    Tool Layer                            │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  Built-in Tools (14)    │  │  Extension Points    │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  Bash Read Glob Grep   │  │  • Tool interface    │  │    │
+│  │  │  Write Edit MultiEdit  │  │  • Registry.Register │  │    │
+│  │  │  LS WebFetch Todo×2    │  │  • MCP auto-import   │  │    │
+│  │  │  Agent SendMessage     │  │  • Custom CanUseTool │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  permissions/           │  │  mcp/                │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  • 5-step chain         │  │  • StdioMCPClient   │  │    │
+│  │  │  • Rule matching        │  │  • JSON-RPC 2.0     │  │    │
+│  │  │  • Interactive prompt   │  │  • Tool wrapper      │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                types/  (wire format)                      │    │
+│  │                                                         │    │
+│  │  Message, ContentBlock, SDKMessage, Usage, APIError      │    │
+│  │  Marshal/Unmarshal (polymorphic JSON)                    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### What is NOT in the SDK (application-layer concerns)
+
+TUI/terminal rendering, slash commands, IDE bridge, voice input, telemetry, plugin system, settings UI. These belong to the application you build on top of the SDK.
+
+### Package layout
 
 ```
 go-claude-go/
@@ -69,28 +172,39 @@ go-claude-go/
 ├── types/
 │   ├── message.go           # Message union + APIError (with IsOverloaded())
 │   ├── content.go           # ContentBlock union (Text, ToolUse, ToolResult, Thinking…)
-│   └── events.go            # Terminal, StreamDeltaEvent
+│   ├── events.go            # Terminal, StreamDeltaEvent
+│   └── marshal.go           # Polymorphic JSON marshal/unmarshal
 ├── engine/
-│   ├── engine.go            # QueryEngine + session state + defaultCanUseTool
-│   └── submit.go            # SubmitMessage() + permission denial tracking
+│   ├── engine.go            # QueryEngine + session state + MCP registration
+│   ├── submit.go            # SubmitMessage() + permission denial tracking
+│   └── agent.go             # Subagent runner (creates child query loops)
 ├── query/
-│   ├── query.go             # Query() entry point + QueryParams (incl. StopHooks)
+│   ├── query.go             # Query() entry point + QueryParams
 │   ├── state.go             # State struct + TransitionReason constants
-│   └── loop.go              # queryLoop() — max_tokens recovery, fallback, stop hooks
+│   └── loop.go              # queryLoop() — max_tokens, fallback, stop hooks
 ├── api/
-│   ├── client.go            # Anthropic HTTP client (SSE) + error type parsing
-│   └── stream.go            # SSE assembler + SSE error event handling
+│   ├── client.go            # Anthropic HTTP client (SSE)
+│   └── stream.go            # SSE assembler + error event handling
 ├── hooks/
 │   └── stop.go              # StopHookFn type definition
+├── mcp/
+│   ├── types.go             # MCPTool, MCPResource, MCPContent, MCPServerConfig
+│   └── client.go            # StdioMCPClient: JSON-RPC 2.0 over stdio
+├── session/
+│   ├── session.go           # SessionMeta, SessionFilePath, NewSessionID
+│   └── persist.go           # AppendMessages, LoadSession, ListSessions
 ├── tools/
-│   ├── tool.go              # Tool interface, AppState, PermissionContext, ReadFileState…
+│   ├── tool.go              # Tool interface, AppState, PermissionContext…
 │   ├── registry.go          # Tool registry (name → Tool)
-│   ├── orchestration.go     # RunTools(): partitioning + side-message forwarding
+│   ├── orchestration.go     # RunTools(): partition + dispatch + side messages
 │   ├── budgetcompact.go     # ApplyToolResultBudget(): 250k char cap
-│   ├── globmatch.go         # Glob-to-regex engine (supports **)
-│   ├── bash.go / read.go / glob.go / grep.go
+│   ├── agent.go             # AgentTool + SendMessageTool
+│   ├── agent_registry.go    # AgentRegistry for subagent coordination
+│   ├── mcp_tool.go          # MCPToolWrapper: adapts MCP tools to Tool interface
+│   ├── bash.go / read.go / glob.go / grep.go / ls.go / webfetch.go
+│   ├── write.go / edit.go / multiedit.go / todo.go
 │   ├── permissions/
-│   │   ├── permissions.go   # 5-step decision chain (HasPermissionsToUseTool)
+│   │   ├── permissions.go   # 5-step decision chain
 │   │   └── interactive.go   # CLI prompt [y/n/a/N] + rule write-back
 │   └── tools_test.go
 └── compact/
@@ -266,13 +380,47 @@ No Anthropic SDK dependency — the API client is implemented directly using `ne
 | Tool concurrency partitioning + side messages | ✅ Complete |
 | Tool-result budget compaction | ✅ Complete |
 | AutoCompact / MicroCompact / Snip | ✅ Complete |
-| Bash / Read / Glob / Grep tools | ✅ Complete |
+| Bash / Read / Glob / Grep / LS / WebFetch tools | ✅ Complete |
+| Write / Edit / MultiEdit tools | ✅ Complete |
+| TodoRead / TodoWrite tools | ✅ Complete |
 | SSE streaming + error event handling | ✅ Complete |
 | Thinking blocks | ✅ Parsed + stripped on model switch |
-| Write / Edit / MultiEdit tools | 🔲 Phase 4 |
-| Session persistence (JSONL) | 🔲 Phase 5 |
-| MCP tool support (stdio JSON-RPC) | 🔲 Phase 6 |
-| Agent / Coordinator-Worker | 🔲 Phase 7 |
+| Session persistence (JSONL) + resume | ✅ Complete |
+| MCP client (stdio JSON-RPC) + tool wrapper | ✅ Complete |
+| Agent / SendMessage + subagent coordination | ✅ Complete |
+
+---
+
+## Roadmap
+
+The SDK is functional today. Below are the three priority tiers for reaching production-grade quality.
+
+### P0 — Agent behavior correctness
+
+| Item | Description |
+|------|-------------|
+| **System prompt builder** | Sectioned builder with environment detection (OS, shell, CWD, git branch, date), dynamic tool description injection, and CLAUDE.md project directive loading. This is the single highest-impact missing piece — without it the model has no environmental awareness. |
+| **API retry** | Exponential backoff for 429/529/5xx with configurable `maxRetries` and jitter. Without retry the SDK is unusable under real API load. |
+| **Bash safety classifier** | Dangerous command pattern library (rm -rf, DROP TABLE, git push --force, etc.) that acts as a safety net even under `bypassPermissions` mode. |
+
+### P1 — Agent interaction quality
+
+| Item | Description |
+|------|-------------|
+| **Hooks expansion** | `PreToolHook`, `PostToolHook`, `MessageHook` with unified `HookFn` interface — the core extension mechanism for SDK users to inject audit, filtering, or rewriting logic without modifying engine code. |
+| **AskUserQuestion tool** | Via `QueryEngineConfig.UserInputFn` callback. SDK users inject their own IO implementation (CLI stdin, web form, Slack bot, etc.). Without this, the model cannot ask for clarification. |
+| **Token estimation + budget** | Accurate token counting, pre-request budget check, proactive compact trigger instead of waiting for 413 errors. |
+| **CLAUDE.md + project context** | Recursive search for `.claude/CLAUDE.md` and `CLAUDE.md` from CWD up to git root, merged into system prompt. |
+
+### P2 — Ecosystem
+
+| Item | Description |
+|------|-------------|
+| **MCP SSE/HTTP transport** | Support for remote MCP servers (GitHub MCP, Slack MCP, etc.) beyond stdio. |
+| **Streaming callback API** | `QueryEngineConfig.OnMessage func(SDKMessage)` callback + `engine.RunSync()` convenience method for simple use cases. |
+| **Structured logging** | `slog.Logger` integration for full observability: API calls, tool execution, permission decisions, compact triggers. |
+| **Test coverage** | Unit tests for core paths: query loop (mock API), compact pipeline, permission chain, session persistence, MCP client. |
+| **Go module publication** | Proper module path, semantic versioning, godoc comments, example directory. |
 
 ---
 

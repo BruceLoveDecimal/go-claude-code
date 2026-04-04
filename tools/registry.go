@@ -25,6 +25,15 @@ func (r *Registry) Register(t Tool) {
 	r.tools[name] = t
 }
 
+// RegisterIfAbsent adds a tool to the registry.  Unlike Register, it silently
+// ignores duplicate names instead of panicking.
+func (r *Registry) RegisterIfAbsent(t Tool) {
+	name := t.Name()
+	if _, exists := r.tools[name]; !exists {
+		r.tools[name] = t
+	}
+}
+
 // Get looks up a tool by name.
 func (r *Registry) Get(name string) (Tool, bool) {
 	t, ok := r.tools[name]
@@ -58,13 +67,22 @@ func (r *Registry) Enabled() []Tool {
 	return out
 }
 
-// DefaultRegistry returns a registry pre-populated with the four built-in
-// tools: Bash, Read, Glob, Grep.
+// DefaultRegistry returns a registry pre-populated with all built-in tools.
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
+	// Read-only exploration tools
 	r.Register(NewBashTool())
 	r.Register(NewReadTool())
 	r.Register(NewGlobTool())
 	r.Register(NewGrepTool())
+	r.Register(NewLSTool())
+	r.Register(NewWebFetchTool())
+	// File mutation tools
+	r.Register(NewWriteTool())
+	r.Register(NewEditTool())
+	r.Register(NewMultiEditTool())
+	// Session task management
+	r.Register(NewTodoReadTool())
+	r.Register(NewTodoWriteTool())
 	return r
 }
