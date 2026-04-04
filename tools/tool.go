@@ -97,6 +97,32 @@ type ToolResult struct {
 // Session-level state types
 // ─────────────────────────────────────────────────────────────────────────────
 
+// TodoStatus represents the lifecycle state of a todo item.
+type TodoStatus string
+
+const (
+	TodoStatusPending    TodoStatus = "pending"
+	TodoStatusInProgress TodoStatus = "in_progress"
+	TodoStatusCompleted  TodoStatus = "completed"
+)
+
+// TodoPriority is the relative importance of a todo item.
+type TodoPriority string
+
+const (
+	TodoPriorityHigh   TodoPriority = "high"
+	TodoPriorityMedium TodoPriority = "medium"
+	TodoPriorityLow    TodoPriority = "low"
+)
+
+// TodoItem represents a single task tracked by the Todo tools.
+type TodoItem struct {
+	ID       string       `json:"id"`
+	Content  string       `json:"content"`
+	Status   TodoStatus   `json:"status"`
+	Priority TodoPriority `json:"priority"`
+}
+
 // AppState is the session-level mutable application state shared across all
 // tool invocations within a conversation.  It mirrors AppState in
 // src/state/AppState.ts.
@@ -105,6 +131,8 @@ type AppState struct {
 	PermissionContext ToolPermissionContext
 	// FastMode enables faster but potentially less thorough responses.
 	FastMode bool
+	// Todos holds the session-scoped task list managed by TodoRead/TodoWrite.
+	Todos []TodoItem
 }
 
 // DefaultAppState returns an AppState with safe defaults.
@@ -245,6 +273,11 @@ type ToolContext struct {
 	// ResponseLength accumulates the total character count of streamed text
 	// deltas for the current turn.  Used for UI progress display.
 	ResponseLength int
+
+	// AgentRegistry is the session-scoped registry of running subagents.
+	// Populated by engine.go; allows Agent and SendMessage tools to coordinate.
+	// May be nil in minimal / test configurations.
+	AgentRegistry *AgentRegistry
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

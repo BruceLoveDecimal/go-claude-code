@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/claude-code/go-claude-go/query"
+	"github.com/claude-code/go-claude-go/session"
 	"github.com/claude-code/go-claude-go/tools"
 	"github.com/claude-code/go-claude-go/types"
 )
@@ -89,6 +90,8 @@ func (qe *QueryEngine) SubmitMessage(
 				SetAppState:             qe.SetAppState,
 				ReadFileState:           qe.readFileState,
 				ContentReplacementState: qe.contentReplState,
+				// Phase 7: subagent coordination.
+				AgentRegistry:           qe.agentRegistry,
 			}
 
 			terminal, err := query.Query(ctx, params, loopOutCh)
@@ -138,6 +141,15 @@ func (qe *QueryEngine) SubmitMessage(
 			qe.mu.Lock()
 			qe.mutableMessages = append(qe.mutableMessages, newMessages...)
 			qe.mu.Unlock()
+		}
+
+		// Append this turn to the JSONL session file when persistence is enabled.
+		if qe.config.SessionPersist && qe.sessionID != "" {
+			// Persist the user prompt + all new messages from this turn.
+			toSave := make([]types.Message, 0, 1+len(newMessages))
+			toSave = append(toSave, userMsg)
+			toSave = append(toSave, newMessages...)
+			_ = session.AppendMessages(qe.sessionID, qe.sessionMeta, toSave)
 		}
 	}()
 

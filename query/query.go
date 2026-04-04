@@ -76,6 +76,11 @@ type QueryParams struct {
 	// blocks.  If any hook returns ShouldRetry=true, the loop performs one
 	// additional API round-trip.
 	StopHooks []hooks.StopHookFn
+
+	// AgentRegistry is the session-scoped registry of running subagents.
+	// Passed into ToolContext so Agent/SendMessage tools can coordinate.
+	// May be nil; tools that need it must nil-check.
+	AgentRegistry *tools.AgentRegistry
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -287,6 +287,7 @@ func queryLoop(
 			QueryTracking:           newQueryTracking(nil),
 			AgentID:                 "",
 			InProgressToolUseIDs:    make(map[string]bool),
+			AgentRegistry:           params.AgentRegistry,
 		}
 
 		toolResultMsgs, sideMessages, err := tools.RunTools(

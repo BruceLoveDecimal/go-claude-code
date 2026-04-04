@@ -4,11 +4,14 @@
 package engine
 
 import (
+	"context"
 	"sync"
 	"time"
 
 	"github.com/claude-code/go-claude-go/api"
 	"github.com/claude-code/go-claude-go/compact"
+	"github.com/claude-code/go-claude-go/mcp"
+	"github.com/claude-code/go-claude-go/session"
 	"github.com/claude-code/go-claude-go/tools"
 	"github.com/claude-code/go-claude-go/tools/permissions"
 	"github.com/claude-code/go-claude-go/types"
@@ -65,6 +68,19 @@ type QueryEngineConfig struct {
 	// DefaultAppState() is used.
 	InitialAppState tools.AppState
 
+	// SessionPersist enables JSONL-based conversation persistence.  When true
+	// each turn is appended to ~/.claude-go/sessions/<SessionID>.jsonl.
+	SessionPersist bool
+
+	// SessionID is the identifier used when SessionPersist is true.  A fresh
+	// UUID is generated automatically if left empty.
+	SessionID string
+
+	// MCPClients is the list of MCP server connections to initialise on
+	// startup.  Each client's tools are dynamically registered into Registry.
+	// If nil, no MCP servers are connected.
+	MCPClients []mcp.Client
+
 	// Verbose enables additional diagnostic output.
 	Verbose bool
 }
@@ -104,6 +120,20 @@ type QueryEngine struct {
 	// permissionDenials records every tool call that was denied this session.
 	permissionDenials []tools.PermissionDenial
 	permDenialsMu     sync.Mutex
+
+	// ── Session persistence (Phase 5) ────────────────────────────────────
+
+	// sessionID is the active session identifier (non-empty when persistence
+	// is enabled).
+	sessionID string
+	// sessionMeta is written as the first JSONL line on session creation.
+	sessionMeta session.SessionMeta
+
+	// ── Subagent coordination (Phase 7) ──────────────────────────────────
+
+	// agentRegistry is the session-scoped registry of running subagents.
+	// Passed into every ToolContext so Agent/SendMessage tools can find peers.
+	agentRegistry *tools.AgentRegistry
 }
 
 // NewQueryEngine creates a QueryEngine from the given config.  Panics if
@@ -141,14 +171,70 @@ func NewQueryEngine(cfg QueryEngineConfig) *QueryEngine {
 		appState = tools.DefaultAppState()
 	}
 
-	return &QueryEngine{
+	// Resolve session ID for persistence.
+	sid := cfg.SessionID
+	if cfg.SessionPersist && sid == "" {
+		sid = session.NewSessionID()
+	}
+
+	agentReg := tools.NewAgentRegistry()
+
+	qe := &QueryEngine{
 		config:           cfg,
 		mutableMessages:  msgs,
 		apiClient:        api.NewClient(cfg.APIKey, cfg.APIBaseURL),
 		appState:         appState,
 		readFileState:    tools.NewReadFileState(),
 		contentReplState: tools.NewContentReplacementState(),
+		sessionID:        sid,
+		agentRegistry:    agentReg,
 	}
+	if cfg.SessionPersist {
+		qe.sessionMeta = session.NewSessionMeta(sid, cfg.Model)
+	}
+
+	// Register Agent and SendMessage tools, wiring them to this engine's runner.
+	cfg.Registry.RegisterIfAbsent(tools.NewAgentTool(qe.agentRunner()))
+	cfg.Registry.RegisterIfAbsent(tools.NewSendMessageTool())
+
+	// Register tools from MCP clients into the registry.
+	// Each client must already be initialized (Initialize() called by the
+	// caller).  Errors from listing tools are silently skipped so a broken
+	// MCP server doesn't prevent the engine from starting.
+	if len(cfg.MCPClients) > 0 {
+		ctx := context.Background()
+		for _, client := range cfg.MCPClients {
+			mcpTools, err := client.ListTools(ctx)
+			if err != nil {
+				continue
+			}
+			for _, t := range mcpTools {
+				wrapper := tools.NewMCPToolWrapper(client, t)
+				// Use RegisterIfAbsent to avoid panics on duplicate names.
+				cfg.Registry.RegisterIfAbsent(wrapper)
+			}
+		}
+	}
+
+	return qe
+}
+
+// SessionID returns the active session identifier.  Empty string means
+// persistence is disabled.
+func (qe *QueryEngine) SessionID() string { return qe.sessionID }
+
+// NewQueryEngineFromSession creates a QueryEngine that resumes an existing
+// persisted session.  The saved messages are loaded as InitialMessages and
+// SessionPersist is automatically enabled so new turns are appended.
+func NewQueryEngineFromSession(cfg QueryEngineConfig, sessionID string) (*QueryEngine, error) {
+	msgs, err := session.LoadSession(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	cfg.InitialMessages = msgs
+	cfg.SessionPersist = true
+	cfg.SessionID = sessionID
+	return NewQueryEngine(cfg), nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
