@@ -27,10 +27,10 @@ for msg := range msgCh { /* stream to user */ }
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    go-claude-go SDK                              │
+│                    go-claude-go SDK                             │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │                  engine.QueryEngine                      │    │
+│  │                  engine.QueryEngine                     │    │
 │  │                                                         │    │
 │  │  • SubmitMessage(ctx, prompt) → (msgCh, errCh)          │    │
 │  │  • GetAppState / SetAppState                            │    │
@@ -38,7 +38,7 @@ for msg := range msgCh { /* stream to user */ }
 │  │  • SessionID() / Resume from session                    │    │
 │  └────────┬──────────────────────┬─────────────────────────┘    │
 │           │                      │                              │
-│     ┌─────▼──────┐        ┌─────▼──────────────┐               │
+│     ┌─────▼──────┐        ┌─────▼──────────────┐                │
 │     │ query.Loop │        │ tools.RunTools      │               │
 │     │            │◄──────►│                     │               │
 │     │ • stream   │        │ • permission check  │               │
@@ -47,44 +47,44 @@ for msg := range msgCh { /* stream to user */ }
 │     └─────┬──────┘        └────────┬────────────┘               │
 │           │                        │                            │
 │  ┌────────▼────────────────────────▼───────────────────────┐    │
-│  │              Infrastructure Layer                        │    │
+│  │              Infrastructure Layer                       │    │
 │  │                                                         │    │
-│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐  │    │
-│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │  │    │
-│  │  │          │ │           │ │          │ │          │  │    │
-│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │  │    │
-│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │          │  │    │
-│  │  │          │ │ • Auto    │ │ • Resume │ │          │  │    │
-│  │  │          │ │ • Budget  │ │          │ │          │  │    │
-│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘  │    │
+│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐   │    │
+│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │   │    │
+│  │  │          │ │           │ │          │ │          │   │    │
+│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │   │    │
+│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │          │   │    │
+│  │  │          │ │ • Auto    │ │ • Resume │ │          │   │    │
+│  │  │          │ │ • Budget  │ │          │ │          │   │    │
+│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘   │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    Tool Layer                            │    │
+│  │                    Tool Layer                           │    │
 │  │                                                         │    │
 │  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
 │  │  │  Built-in Tools (14)    │  │  Extension Points    │  │    │
 │  │  │                         │  │                      │  │    │
-│  │  │  Bash Read Glob Grep   │  │  • Tool interface    │  │    │
-│  │  │  Write Edit MultiEdit  │  │  • Registry.Register │  │    │
-│  │  │  LS WebFetch Todo×2    │  │  • MCP auto-import   │  │    │
-│  │  │  Agent SendMessage     │  │  • Custom CanUseTool │  │    │
+│  │  │  Bash Read Glob Grep    │  │  • Tool interface    │  │    │
+│  │  │  Write Edit MultiEdit   │  │  • Registry.Register │  │    │
+│  │  │  LS WebFetch Todo×2     │  │  • MCP auto-import   │  │    │
+│  │  │  Agent SendMessage      │  │  • Custom CanUseTool │  │    │
 │  │  └─────────────────────────┘  └──────────────────────┘  │    │
 │  │                                                         │    │
 │  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
 │  │  │  permissions/           │  │  mcp/                │  │    │
 │  │  │                         │  │                      │  │    │
-│  │  │  • 5-step chain         │  │  • StdioMCPClient   │  │    │
-│  │  │  • Rule matching        │  │  • JSON-RPC 2.0     │  │    │
+│  │  │  • 5-step chain         │  │  • StdioMCPClient    │  │    │
+│  │  │  • Rule matching        │  │  • JSON-RPC 2.0      │  │    │
 │  │  │  • Interactive prompt   │  │  • Tool wrapper      │  │    │
 │  │  └─────────────────────────┘  └──────────────────────┘  │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │                types/  (wire format)                      │    │
+│  │                types/  (wire format)                    │    │
 │  │                                                         │    │
-│  │  Message, ContentBlock, SDKMessage, Usage, APIError      │    │
-│  │  Marshal/Unmarshal (polymorphic JSON)                    │    │
+│  │  Message, ContentBlock, SDKMessage, Usage, APIError     │    │
+│  │  Marshal/Unmarshal (polymorphic JSON)                   │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
