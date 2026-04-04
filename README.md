@@ -1,4 +1,4 @@
-# go-claude-go
+# go-claude-code
 
 A Go Agent SDK modeled on the core engine of [Claude Code](https://github.com/anthropics/claude-code). Not a CLI clone — this is a library for Go developers to build their own agent applications.
 
