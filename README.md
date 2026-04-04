@@ -1,6 +1,6 @@
 # go-claude-code
 
-A Go Agent SDK modeled on the core engine of [Claude Code](https://github.com/anthropics/claude-code). Not a CLI clone — this is a library for Go developers to build their own agent applications.
+A Go Agent SDK modeled on the core engine of Claude Code
 
 **~35 Go source files · ~6,000 lines · single binary · zero Node.js dependency**
 
@@ -17,77 +17,6 @@ qe := engine.NewQueryEngine(engine.QueryEngineConfig{
 msgCh, errCh := qe.SubmitMessage(ctx, "Fix the failing test")
 for msg := range msgCh { /* stream to user */ }
 ```
-
-## What this implements
-
-Nine core modules, faithfully mirroring the TypeScript architecture:
-
-| Module | Go package | TypeScript source |
-|--------|-----------|-------------------|
-| **QueryEngine** — stateful conversation manager, one instance per session | `engine/` | `src/QueryEngine.ts` |
-| **query() / AgentLoop** — the `while(true)` state machine that drives tool calls | `query/` | `src/query.ts` |
-| **Tool Orchestration** — concurrency-partitioned tool dispatch | `tools/` | `src/services/tools/toolOrchestration.ts` |
-| **Permission System** — 5-step permission decision chain + interactive CLI | `tools/permissions/` | `src/hooks/useCanUseTool.tsx` |
-| **Context Management** — four-layer compaction pipeline | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
-| **Stop Hooks** — post-response hook framework | `hooks/` | `src/hooks/` |
-| **Session Persistence** — JSONL conversation history with resume | `session/` | `src/utils/sessionStorage.ts` |
-| **MCP Client** — stdio JSON-RPC 2.0 with dynamic tool registration | `mcp/` | `src/services/mcp/` |
-| **Agent / Subagent** — nested agentic loops with coordinator pattern | `engine/agent.go` + `tools/agent.go` | `src/tools/AgentTool/` |
-
-### Permission System (Phase 2)
-
-Five-step decision chain mirroring the TypeScript `hasPermissionsToUseTool()`:
-
-1. **bypassPermissions** mode → unconditional allow
-2. **AlwaysDenyRules** match → deny
-3. **AlwaysAllowRules** match → allow
-4. Tool `IsReadOnly()` + **dontAsk** / **acceptEdits** mode → allow
-5. Otherwise → **interactive CLI prompt** `[y/n/a/N]`
-
-Four permission modes: `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`
-
-Interactive decisions ("always" / "never") are written back to session rules via `SetAppState`, so repeated tool calls don't re-prompt. Non-TTY stdin automatically denies.
-
-### Context Management layers
-
-| Layer | File | Behaviour |
-|-------|------|-----------|
-| **ToolResultBudget** | `tools/budgetcompact.go` | Caps total tool_result content at 250k chars; truncates oldest large results first. |
-| **AutoCompact** | `compact/autocompact.go` | Full conversation summarisation when context exceeds threshold. Circuit breaker after 3 failures. |
-| **MicroCompact** | `compact/microcompact.go` | Deduplicates repeated `tool_result` blocks for the same `tool_use_id`. |
-| **Snip** | `compact/snip.go` | Pattern-based removal of redundant intermediate Bash/Grep/Glob outputs. |
-
-### Query Loop Control Flow (Phase 3)
-
-| Feature | Behaviour |
-|---------|-----------|
-| **max_tokens recovery** | Detects `stop_reason == "max_tokens"` → injects continuation nudge (up to 3×) → escalates to 64k tokens |
-| **Fallback model** | Detects HTTP 529 / SSE `overloaded_error` → switches to `FallbackModel`, strips thinking block signatures |
-| **ToolResult.NewMessages** | Side-channel messages from tools forwarded to output (UI) but not added to API history |
-| **Stop hooks** | `StopHookFn` runs after terminal responses; can trigger one more API round-trip |
-| **Permission denial tracking** | Every `PermBlock` recorded in `QueryEngine.PermissionDenials()` audit log |
-
-### Built-in tools (14)
-
-| Tool | File | Description |
-|------|------|-------------|
-| **Bash** | `tools/bash.go` | Executes shell commands via `bash -c`. Read-only commands are concurrency-safe. |
-| **Read** | `tools/read.go` | Reads files with line numbers; supports `offset` and `limit`. |
-| **Glob** | `tools/glob.go` | Finds files matching a glob pattern (supports `**` recursive). |
-| **Grep** | `tools/grep.go` | Searches file contents with a regular expression. |
-| **LS** | `tools/ls.go` | Lists directory contents as a tree; supports ignore patterns. |
-| **WebFetch** | `tools/webfetch.go` | Fetches URLs and extracts plain text from HTML. |
-| **Write** | `tools/write.go` | Creates or overwrites files; updates ReadFileState cache. |
-| **Edit** | `tools/edit.go` | Exact string replacement; supports `replace_all`. |
-| **MultiEdit** | `tools/multiedit.go` | Sequential batch edits in a single file. |
-| **TodoRead** | `tools/todo.go` | Reads session-scoped task list from AppState. |
-| **TodoWrite** | `tools/todo.go` | Replaces session-scoped task list in AppState. |
-| **Agent** | `tools/agent.go` | Spawns a subagent with independent query loop. |
-| **SendMessage** | `tools/agent.go` | Sends a follow-up prompt to a running subagent. |
-| **MCP tools** | `tools/mcp_tool.go` | Dynamically registered from MCP servers. |
-
----
-
 ## SDK Architecture
 
 ```
@@ -160,6 +89,75 @@ Interactive decisions ("always" / "never") are written back to session rules via
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+## What this implements
+
+Nine core modules, faithfully mirroring the TypeScript architecture:
+
+| Module | Go package | TypeScript source |
+|--------|-----------|-------------------|
+| **QueryEngine** — stateful conversation manager, one instance per session | `engine/` | `src/QueryEngine.ts` |
+| **query() / AgentLoop** — the `while(true)` state machine that drives tool calls | `query/` | `src/query.ts` |
+| **Tool Orchestration** — concurrency-partitioned tool dispatch | `tools/` | `src/services/tools/toolOrchestration.ts` |
+| **Permission System** — 5-step permission decision chain + interactive CLI | `tools/permissions/` | `src/hooks/useCanUseTool.tsx` |
+| **Context Management** — four-layer compaction pipeline | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
+| **Stop Hooks** — post-response hook framework | `hooks/` | `src/hooks/` |
+| **Session Persistence** — JSONL conversation history with resume | `session/` | `src/utils/sessionStorage.ts` |
+| **MCP Client** — stdio JSON-RPC 2.0 with dynamic tool registration | `mcp/` | `src/services/mcp/` |
+| **Agent / Subagent** — nested agentic loops with coordinator pattern | `engine/agent.go` + `tools/agent.go` | `src/tools/AgentTool/` |
+
+### Permission System
+
+Five-step decision chain mirroring the TypeScript `hasPermissionsToUseTool()`:
+
+1. **bypassPermissions** mode → unconditional allow
+2. **AlwaysDenyRules** match → deny
+3. **AlwaysAllowRules** match → allow
+4. Tool `IsReadOnly()` + **dontAsk** / **acceptEdits** mode → allow
+5. Otherwise → **interactive CLI prompt** `[y/n/a/N]`
+
+Four permission modes: `default`, `acceptEdits`, `bypassPermissions`, `dontAsk`
+
+Interactive decisions ("always" / "never") are written back to session rules via `SetAppState`, so repeated tool calls don't re-prompt. Non-TTY stdin automatically denies.
+
+### Context Management layers
+
+| Layer | File | Behaviour |
+|-------|------|-----------|
+| **ToolResultBudget** | `tools/budgetcompact.go` | Caps total tool_result content at 250k chars; truncates oldest large results first. |
+| **AutoCompact** | `compact/autocompact.go` | Full conversation summarisation when context exceeds threshold. Circuit breaker after 3 failures. |
+| **MicroCompact** | `compact/microcompact.go` | Deduplicates repeated `tool_result` blocks for the same `tool_use_id`. |
+| **Snip** | `compact/snip.go` | Pattern-based removal of redundant intermediate Bash/Grep/Glob outputs. |
+
+### Query Loop Control Flow
+
+| Feature | Behaviour |
+|---------|-----------|
+| **max_tokens recovery** | Detects `stop_reason == "max_tokens"` → injects continuation nudge (up to 3×) → escalates to 64k tokens |
+| **Fallback model** | Detects HTTP 529 / SSE `overloaded_error` → switches to `FallbackModel`, strips thinking block signatures |
+| **ToolResult.NewMessages** | Side-channel messages from tools forwarded to output (UI) but not added to API history |
+| **Stop hooks** | `StopHookFn` runs after terminal responses; can trigger one more API round-trip |
+| **Permission denial tracking** | Every `PermBlock` recorded in `QueryEngine.PermissionDenials()` audit log |
+
+### Built-in tools (14)
+
+| Tool | File | Description |
+|------|------|-------------|
+| **Bash** | `tools/bash.go` | Executes shell commands via `bash -c`. Read-only commands are concurrency-safe. |
+| **Read** | `tools/read.go` | Reads files with line numbers; supports `offset` and `limit`. |
+| **Glob** | `tools/glob.go` | Finds files matching a glob pattern (supports `**` recursive). |
+| **Grep** | `tools/grep.go` | Searches file contents with a regular expression. |
+| **LS** | `tools/ls.go` | Lists directory contents as a tree; supports ignore patterns. |
+| **WebFetch** | `tools/webfetch.go` | Fetches URLs and extracts plain text from HTML. |
+| **Write** | `tools/write.go` | Creates or overwrites files; updates ReadFileState cache. |
+| **Edit** | `tools/edit.go` | Exact string replacement; supports `replace_all`. |
+| **MultiEdit** | `tools/multiedit.go` | Sequential batch edits in a single file. |
+| **TodoRead** | `tools/todo.go` | Reads session-scoped task list from AppState. |
+| **TodoWrite** | `tools/todo.go` | Replaces session-scoped task list in AppState. |
+| **Agent** | `tools/agent.go` | Spawns a subagent with independent query loop. |
+| **SendMessage** | `tools/agent.go` | Sends a follow-up prompt to a running subagent. |
+| **MCP tools** | `tools/mcp_tool.go` | Dynamically registered from MCP servers. |
+
+---
 ### What is NOT in the SDK (application-layer concerns)
 
 TUI/terminal rendering, slash commands, IDE bridge, voice input, telemetry, plugin system, settings UI. These belong to the application you build on top of the SDK.
