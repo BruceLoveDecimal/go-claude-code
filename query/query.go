@@ -10,6 +10,7 @@ import (
 	"github.com/claude-code/go-claude-go/types"
 )
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // QueryParams
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,12 +76,54 @@ type QueryParams struct {
 	// StopHooks are invoked after each API response that contains no tool_use
 	// blocks.  If any hook returns ShouldRetry=true, the loop performs one
 	// additional API round-trip.
+	//
+	// Deprecated: prefer Hooks.StopHooks.  When both are set, Hooks.StopHooks
+	// takes precedence.
 	StopHooks []hooks.StopHookFn
+
+	// Hooks bundles all hook types (stop, pre-tool, post-tool, message).
+	// Takes precedence over the standalone StopHooks field.
+	Hooks hooks.HookSet
+
+	// RetryConfig controls exponential-backoff retries for transient API errors.
+	// Zero value → api.DefaultRetryConfig().
+	RetryConfig api.RetryConfig
+
+	// UserInputFn is forwarded into ToolContext so AskUserQuestion can call it.
+	// If nil, AskUserQuestion returns an error to the model.
+	UserInputFn tools.UserInputFn
 
 	// AgentRegistry is the session-scoped registry of running subagents.
 	// Passed into ToolContext so Agent/SendMessage tools can coordinate.
 	// May be nil; tools that need it must nil-check.
 	AgentRegistry *tools.AgentRegistry
+
+	// ── API feature parameters ───────────────────────────────────────────
+
+	// Thinking configures extended thinking for API requests.
+	// Zero value = omit (no thinking).
+	Thinking api.ThinkingConfig
+
+	// ToolChoice controls how the model selects tools.  Nil = auto.
+	ToolChoice *api.ToolChoice
+
+	// Temperature controls randomness.  Nil = server default.
+	// Must not be set when Thinking is enabled.
+	Temperature *float64
+
+	// Betas is the list of beta feature strings sent in the anthropic-beta header.
+	Betas []string
+
+	// Metadata is optional request metadata (user_id etc.).
+	Metadata *api.RequestMetadata
+
+	// EnableCaching enables prompt caching (cache_control markers on
+	// system prompt and last user message).
+	EnableCaching bool
+
+	// PostCompactRestore provides context to re-inject after compaction.
+	// If nil, no restoration messages are injected.
+	PostCompactRestore *compact.PostCompactConfig
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -111,6 +154,14 @@ func Query(
 	}
 	if params.ContentReplacementState == nil {
 		params.ContentReplacementState = tools.NewContentReplacementState()
+	}
+	// Merge legacy StopHooks into Hooks.StopHooks (Hooks takes precedence).
+	if len(params.StopHooks) > 0 && len(params.Hooks.StopHooks) == 0 {
+		params.Hooks.StopHooks = params.StopHooks
+	}
+	// Apply retry defaults.
+	if params.RetryConfig.MaxRetries == 0 {
+		params.RetryConfig = api.DefaultRetryConfig()
 	}
 	return queryLoop(ctx, params, outCh)
 }

@@ -85,13 +85,24 @@ func (qe *QueryEngine) SubmitMessage(
 				MaxTurns:                qe.config.MaxTurns,
 				Verbose:                 qe.config.Verbose,
 				AutoCompact:             qe.config.AutoCompact,
+				RetryConfig:             qe.config.RetryConfig,
 				// Phase 1: wire session-level state into the query loop.
 				GetAppState:             qe.GetAppState,
 				SetAppState:             qe.SetAppState,
 				ReadFileState:           qe.readFileState,
 				ContentReplacementState: qe.contentReplState,
+				// P0/P1: hooks and user input.
+				Hooks:                   qe.config.Hooks,
+				UserInputFn:             qe.config.UserInputFn,
 				// Phase 7: subagent coordination.
 				AgentRegistry:           qe.agentRegistry,
+				// API feature parameters.
+				Thinking:                qe.config.Thinking,
+				ToolChoice:              qe.config.ToolChoice,
+				Temperature:             qe.config.Temperature,
+				Betas:                   qe.config.Betas,
+				Metadata:                qe.config.Metadata,
+				EnableCaching:           qe.config.EnableCaching,
 			}
 
 			terminal, err := query.Query(ctx, params, loopOutCh)
@@ -126,6 +137,13 @@ func (qe *QueryEngine) SubmitMessage(
 				// System messages (compact boundaries, etc.) go into history.
 				if m.Subtype == types.SystemSubtypeCompactBoundary {
 					newMessages = append(newMessages, m)
+				}
+			}
+			// Invoke message hooks (non-blocking; errors terminate the turn).
+			for _, h := range qe.config.Hooks.MessageHooks {
+				if hookErr := h(ctx, msg); hookErr != nil {
+					errCh <- hookErr
+					return
 				}
 			}
 			msgCh <- msg

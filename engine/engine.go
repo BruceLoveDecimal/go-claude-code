@@ -10,7 +10,9 @@ import (
 
 	"github.com/claude-code/go-claude-go/api"
 	"github.com/claude-code/go-claude-go/compact"
+	"github.com/claude-code/go-claude-go/hooks"
 	"github.com/claude-code/go-claude-go/mcp"
+	"github.com/claude-code/go-claude-go/prompt"
 	"github.com/claude-code/go-claude-go/session"
 	"github.com/claude-code/go-claude-go/tools"
 	"github.com/claude-code/go-claude-go/tools/permissions"
@@ -80,6 +82,40 @@ type QueryEngineConfig struct {
 	// startup.  Each client's tools are dynamically registered into Registry.
 	// If nil, no MCP servers are connected.
 	MCPClients []mcp.Client
+
+	// Hooks bundles the stop/pre-tool/post-tool/message hook slices.
+	// Any subset may be populated; nil slices are ignored.
+	Hooks hooks.HookSet
+
+	// UserInputFn is called by the AskUserQuestion tool when the model needs
+	// interactive input from the user.  If nil, AskUserQuestion returns an
+	// error to the model.
+	UserInputFn tools.UserInputFn
+
+	// RetryConfig controls exponential-backoff retries on transient API errors
+	// (429, 529, 5xx).  Zero value → api.DefaultRetryConfig().
+	RetryConfig api.RetryConfig
+
+	// ── API feature parameters ───────────────────────────────────────────
+
+	// Thinking configures extended thinking for API requests.
+	// Zero value = no thinking.
+	Thinking api.ThinkingConfig
+
+	// ToolChoice controls how the model selects tools.  Nil = auto.
+	ToolChoice *api.ToolChoice
+
+	// Temperature controls randomness.  Nil = server default.
+	Temperature *float64
+
+	// Betas is the list of beta feature strings sent in the anthropic-beta header.
+	Betas []string
+
+	// Metadata is optional request metadata.
+	Metadata *api.RequestMetadata
+
+	// EnableCaching enables prompt caching on system prompt and messages.
+	EnableCaching bool
 
 	// Verbose enables additional diagnostic output.
 	Verbose bool
@@ -158,6 +194,10 @@ func NewQueryEngine(cfg QueryEngineConfig) *QueryEngine {
 	if cfg.AutoCompact.Model == "" {
 		cfg.AutoCompact.Model = cfg.Model
 	}
+	// Apply retry defaults when caller did not customise the config.
+	if cfg.RetryConfig.MaxRetries == 0 {
+		cfg.RetryConfig = api.DefaultRetryConfig()
+	}
 
 	// Seed conversation history.
 	msgs := make([]types.Message, 0)
@@ -196,6 +236,8 @@ func NewQueryEngine(cfg QueryEngineConfig) *QueryEngine {
 	// Register Agent and SendMessage tools, wiring them to this engine's runner.
 	cfg.Registry.RegisterIfAbsent(tools.NewAgentTool(qe.agentRunner()))
 	cfg.Registry.RegisterIfAbsent(tools.NewSendMessageTool())
+	// Register AskUserQuestion (enabled when UserInputFn is provided).
+	cfg.Registry.RegisterIfAbsent(tools.NewAskUserTool())
 
 	// Register tools from MCP clients into the registry.
 	// Each client must already be initialized (Initialize() called by the
@@ -278,16 +320,16 @@ func (qe *QueryEngine) SetAppState(f func(tools.AppState) tools.AppState) {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// buildSystemPrompt assembles the effective system prompt from config.
+// buildSystemPrompt assembles the effective system prompt using prompt.Build.
+// It injects environment context, CLAUDE.md directives, and tool descriptions
+// around any caller-supplied base/append content.
 func (qe *QueryEngine) buildSystemPrompt() string {
-	sp := qe.config.SystemPrompt
-	if qe.config.AppendSystemPrompt != "" {
-		if sp != "" {
-			sp += "\n\n"
-		}
-		sp += qe.config.AppendSystemPrompt
-	}
-	return sp
+	return prompt.Build(prompt.BuildConfig{
+		CWD:                qe.config.CWD,
+		Registry:           qe.config.Registry,
+		BaseSystemPrompt:   qe.config.SystemPrompt,
+		AppendSystemPrompt: qe.config.AppendSystemPrompt,
+	})
 }
 
 // PermissionDenials returns a snapshot of all tool permission denials recorded

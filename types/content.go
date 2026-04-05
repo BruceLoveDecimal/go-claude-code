@@ -12,6 +12,7 @@ const (
 	ContentTypeThinking    ContentBlockType = "thinking"
 	ContentTypeRedacted    ContentBlockType = "redacted_thinking"
 	ContentTypeImage       ContentBlockType = "image"
+	ContentTypeDocument    ContentBlockType = "document"
 )
 
 // ContentBlock is the discriminated union for all content block kinds.
@@ -72,6 +73,26 @@ type RedactedThinkingBlock struct {
 
 func (b *RedactedThinkingBlock) GetBlockType() ContentBlockType { return ContentTypeRedacted }
 
+// ImageBlock holds a base64-encoded image sent to or received from the model.
+type ImageBlock struct {
+	Type       ContentBlockType `json:"type"`
+	SourceType string           `json:"source_type"` // "base64"
+	MediaType  string           `json:"media_type"`  // e.g. "image/png"
+	Data       string           `json:"data"`        // base64-encoded
+}
+
+func (b *ImageBlock) GetBlockType() ContentBlockType { return ContentTypeImage }
+
+// DocumentBlock holds a base64-encoded document (PDF etc.) sent to the model.
+type DocumentBlock struct {
+	Type       ContentBlockType `json:"type"`
+	SourceType string           `json:"source_type"` // "base64"
+	MediaType  string           `json:"media_type"`  // e.g. "application/pdf"
+	Data       string           `json:"data"`        // base64-encoded
+}
+
+func (b *DocumentBlock) GetBlockType() ContentBlockType { return ContentTypeDocument }
+
 // UnmarshalContentBlock deserializes a raw JSON content block by type discriminant.
 func UnmarshalContentBlock(raw json.RawMessage) (ContentBlock, error) {
 	var disc struct {
@@ -109,6 +130,43 @@ func UnmarshalContentBlock(raw json.RawMessage) (ContentBlock, error) {
 		var b RedactedThinkingBlock
 		if err := json.Unmarshal(raw, &b); err != nil {
 			return nil, err
+		}
+		return &b, nil
+	case ContentTypeImage:
+		var b ImageBlock
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		// Extract nested source fields.
+		var wrapper struct {
+			Source struct {
+				Type      string `json:"type"`
+				MediaType string `json:"media_type"`
+				Data      string `json:"data"`
+			} `json:"source"`
+		}
+		if json.Unmarshal(raw, &wrapper) == nil && wrapper.Source.Type != "" {
+			b.SourceType = wrapper.Source.Type
+			b.MediaType = wrapper.Source.MediaType
+			b.Data = wrapper.Source.Data
+		}
+		return &b, nil
+	case ContentTypeDocument:
+		var b DocumentBlock
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return nil, err
+		}
+		var wrapper struct {
+			Source struct {
+				Type      string `json:"type"`
+				MediaType string `json:"media_type"`
+				Data      string `json:"data"`
+			} `json:"source"`
+		}
+		if json.Unmarshal(raw, &wrapper) == nil && wrapper.Source.Type != "" {
+			b.SourceType = wrapper.Source.Type
+			b.MediaType = wrapper.Source.MediaType
+			b.Data = wrapper.Source.Data
 		}
 		return &b, nil
 	default:

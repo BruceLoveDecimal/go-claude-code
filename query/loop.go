@@ -21,8 +21,9 @@ const (
 	maxOutputTokensEscalated = 64_000
 
 	// continuationNudge is injected after a max_tokens stop to make the
-	// model resume from where it left off.
-	continuationNudge = "Continue from where you left off exactly, without any commentary."
+	// model resume from where it left off.  Matches the detailed TS prompt
+	// that prevents the model from apologising or recapping.
+	continuationNudge = "Output token limit hit. Resume directly — no apology, no recap, no filler. Continue exactly from where you stopped, picking up mid-word or mid-line if necessary."
 )
 
 // newQueryTracking creates the initial QueryChainTracking for a loop, or
@@ -94,9 +95,17 @@ func queryLoop(
 				}
 				msgsForQuery = compResult.SummaryMessages
 
+				// Post-compact context restoration.
+				if params.PostCompactRestore != nil {
+					if attachment := compact.BuildPostCompactAttachment(*params.PostCompactRestore); attachment != nil {
+						msgsForQuery = append(msgsForQuery, attachment)
+						outCh <- attachment
+					}
+				}
+
 				newFullHistory := append(
 					getMessagesBeforeCompactBoundary(messages),
-					compResult.SummaryMessages...,
+					msgsForQuery...,
 				)
 				state = state.withMessages(newFullHistory).withAutoCompact(
 					&compact.AutoCompactTrackingState{
@@ -120,11 +129,17 @@ func queryLoop(
 
 		toolsList := params.Registry.Enabled()
 		streamParams := api.StreamParams{
-			Messages:     msgsForQuery,
-			SystemPrompt: params.SystemPrompt,
-			Tools:        toolsList,
-			Model:        currentModel,
-			MaxTokens:    maxTokens,
+			Messages:      msgsForQuery,
+			SystemPrompt:  params.SystemPrompt,
+			Tools:         toolsList,
+			Model:         currentModel,
+			MaxTokens:     maxTokens,
+			Thinking:      params.Thinking,
+			ToolChoice:    params.ToolChoice,
+			Temperature:   params.Temperature,
+			Betas:         params.Betas,
+			Metadata:      params.Metadata,
+			EnableCaching: params.EnableCaching,
 		}
 
 		var (
@@ -134,12 +149,45 @@ func queryLoop(
 			withheld413    bool
 		)
 
-		streamCh, streamErrCh := api.StreamMessage(ctx, params.APIClient, streamParams)
+		// Create a streaming tool executor that starts concurrent-safe tools
+		// as soon as their input JSON is fully streamed (before the full
+		// response is assembled).
+		turnCtx, turnCancel := context.WithCancel(ctx)
+		streamingExec := tools.NewStreamingToolExecutor(
+			params.CanUseTool,
+			tools.ToolContext{
+				Ctx:                     turnCtx,
+				AbortFunc:               turnCancel,
+				WorkingDir:              params.WorkingDir,
+				Messages:                messages,
+				Registry:                params.Registry,
+				Verbose:                 params.Verbose,
+				GetAppState:             params.GetAppState,
+				SetAppState:             params.SetAppState,
+				ReadFileState:           params.ReadFileState,
+				ContentReplacementState: params.ContentReplacementState,
+				QueryTracking:           newQueryTracking(nil),
+				AgentID:                 "",
+				InProgressToolUseIDs:    make(map[string]bool),
+				AgentRegistry:           params.AgentRegistry,
+				UserInputFn:             params.UserInputFn,
+			},
+			params.Hooks.PreToolHooks,
+			params.Hooks.PostToolHooks,
+		)
+
+		streamCh, streamErrCh := api.StreamMessageWithRetry(ctx, params.APIClient, streamParams, params.RetryConfig)
 
 		for event := range streamCh {
 			switch e := event.(type) {
 			case *types.StreamDeltaEvent:
 				outCh <- e
+			case *types.BlockCompleteEvent:
+				// Feed completed tool_use blocks to the streaming executor
+				// so they can start executing immediately.
+				if e.ToolUseBlock != nil {
+					streamingExec.OnBlockComplete(e.ToolUseBlock)
+				}
 			case *types.AssistantMessage:
 				finalAssistant = e
 				for _, blk := range e.Msg.Content {
@@ -199,9 +247,27 @@ func queryLoop(
 		}
 
 		// ── 6. max_output_tokens recovery (Phase 3a) ─────────────────────────
+		// Matches TS order: escalate first (8k→64k without nudge), then nudge.
 		if finalAssistant != nil && finalAssistant.Msg.StopReason == "max_tokens" {
+			// Phase A: Escalate token budget if not already escalated.
+			if state.MaxOutputTokensOverride == nil {
+				override := maxOutputTokensEscalated
+				reason := TransitionMaxTokensEscalate
+				newMsgs := make([]types.Message, len(messages))
+				copy(newMsgs, messages)
+				newMsgs = append(newMsgs, finalAssistant)
+				state = State{
+					Messages:                     newMsgs,
+					AutoCompactTracking:          state.AutoCompactTracking,
+					MaxOutputTokensRecoveryCount: 0,
+					MaxOutputTokensOverride:      &override,
+					TurnCount:                    turnCount + 1,
+					Transition:                   &reason,
+				}
+				continue
+			}
+			// Phase B: Already escalated — inject continuation nudge.
 			if state.MaxOutputTokensRecoveryCount < maxOutputTokensRecoveryLimit {
-				// Inject a continuation nudge and retry.
 				nudge := types.NewUserMessage(continuationNudge)
 				outCh <- nudge
 				newMsgs := make([]types.Message, len(messages))
@@ -218,37 +284,30 @@ func queryLoop(
 				}
 				continue
 			}
-			// Exhausted retries — escalate to larger token budget.
-			override := maxOutputTokensEscalated
-			reason := TransitionMaxTokensEscalate
-			newMsgs := make([]types.Message, len(messages))
-			copy(newMsgs, messages)
-			newMsgs = append(newMsgs, finalAssistant)
-			state = State{
-				Messages:                     newMsgs,
-				AutoCompactTracking:          state.AutoCompactTracking,
-				MaxOutputTokensRecoveryCount: 0,
-				MaxOutputTokensOverride:      &override,
-				TurnCount:                    turnCount + 1,
-				Transition:                   &reason,
-			}
-			continue
+			// Exhausted all recovery attempts — return completed with truncation.
+			return types.Terminal{Reason: "max_output_tokens_exhausted"}, nil
 		}
 
 		// ── 7. Terminal check — no tool calls → turn complete ────────────────
 		if !needsFollowUp {
 			// Run stop hooks (Phase 3d) — any may request one more round-trip.
-			for _, hook := range params.StopHooks {
-				shouldRetry, hookErr := hook(ctx, finalAssistant)
-				if hookErr != nil {
-					return types.Terminal{Reason: "stop_hook_error"}, hookErr
-				}
-				if shouldRetry {
-					reason := TransitionNextTurn
-					state = state.withTransition(reason)
-					state.TurnCount = turnCount + 1
-					needsFollowUp = true // break out and re-enter the loop
-					break
+			// Safety: skip stop hooks when the last message was an API error to
+			// prevent a "death spiral" where the hook triggers another call that
+			// also fails.
+			skipStopHooks := finalAssistant != nil && finalAssistant.IsAPIErrorMessage
+			if !skipStopHooks {
+				for _, hook := range params.Hooks.StopHooks {
+					shouldRetry, hookErr := hook(ctx, finalAssistant)
+					if hookErr != nil {
+						return types.Terminal{Reason: "stop_hook_error"}, hookErr
+					}
+					if shouldRetry {
+						reason := TransitionNextTurn
+						state = state.withTransition(reason)
+						state.TurnCount = turnCount + 1
+						needsFollowUp = true // break out and re-enter the loop
+						break
+					}
 				}
 			}
 			if !needsFollowUp {
@@ -269,32 +328,11 @@ func queryLoop(
 		default:
 		}
 
-		// ── 10. Execute tools ─────────────────────────────────────────────────
-		turnCtx, turnCancel := context.WithCancel(ctx)
-		defer turnCancel()
-
-		toolCtx := tools.ToolContext{
-			Ctx:                     turnCtx,
-			AbortFunc:               turnCancel,
-			WorkingDir:              params.WorkingDir,
-			Messages:                messages,
-			Registry:                params.Registry,
-			Verbose:                 params.Verbose,
-			GetAppState:             params.GetAppState,
-			SetAppState:             params.SetAppState,
-			ReadFileState:           params.ReadFileState,
-			ContentReplacementState: params.ContentReplacementState,
-			QueryTracking:           newQueryTracking(nil),
-			AgentID:                 "",
-			InProgressToolUseIDs:    make(map[string]bool),
-			AgentRegistry:           params.AgentRegistry,
-		}
-
-		toolResultMsgs, sideMessages, err := tools.RunTools(
-			toolUseBlocks,
-			params.CanUseTool,
-			toolCtx,
-		)
+		// ── 10. Execute tools via streaming executor ─────────────────────────
+		// Concurrent-safe tools were already started during streaming.
+		// Finish() waits for them and runs remaining sequential tools.
+		toolResultMsgs, sideMessages, err := streamingExec.Finish(toolUseBlocks)
+		turnCancel() // release the per-turn context
 		if err != nil {
 			return types.Terminal{Reason: "tool_error"}, err
 		}
