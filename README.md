@@ -1,6 +1,6 @@
-# go-claude-go
+# go-claude-code
 
-A Go Agent SDK modeled on the core engine of [Claude Code](https://github.com/anthropics/claude-code). Not a CLI clone — this is a library for Go developers to build their own agent applications.
+A Go Agent SDK modeled on the core engine of Claude Code
 
 **~40 Go source files · ~7,500 lines · single binary · zero Node.js dependency**
 
@@ -18,6 +18,81 @@ qe := engine.NewQueryEngine(engine.QueryEngineConfig{
 })
 msgCh, errCh := qe.SubmitMessage(ctx, "Fix the failing test")
 for msg := range msgCh { /* stream to user */ }
+```
+## SDK Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      User Application                           │
+│  (CLI app, API server, CI pipeline, Slack bot, etc.)            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    go-claude-go SDK                             │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                  engine.QueryEngine                     │    │
+│  │                                                         │    │
+│  │  • SubmitMessage(ctx, prompt) → (msgCh, errCh)          │    │
+│  │  • GetAppState / SetAppState                            │    │
+│  │  • Messages() / TotalUsage()                            │    │
+│  │  • SessionID() / Resume from session                    │    │
+│  │  • Thinking / Caching / ToolChoice / Temperature        │    │
+│  └────────┬──────────────────────┬─────────────────────────┘    │
+│           │                      │                              │
+│     ┌─────▼──────┐        ┌─────▼───────────────┐               │
+│     │ query.Loop │        │ tools.RunTools      │               │
+│     │            │◄──────►│                     │               │
+│     │ • stream   │        │ • permission check  │               │
+│     │ • recover  │        │ • streaming exec    │               │
+│     │ • compact  │        │ • concurrent batch  │               │
+│     └─────┬──────┘        └────────┬────────────┘               │
+│           │                        │                            │
+│  ┌────────▼────────────────────────▼───────────────────────┐    │
+│  │              Infrastructure Layer                       │    │
+│  │                                                         │    │
+│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐   │    │
+│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │   │    │
+│  │  │          │ │           │ │          │ │          │   │    │
+│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │   │    │
+│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │ • Pre    │   │    │
+│  │  │ • Retry  │ │ • Auto    │ │ • Resume │ │ • Post   │   │    │
+│  │  │ • Think  │ │ • Budget  │ │          │ │ • Msg    │   │    │
+│  │  │ • Cache  │ │ • Restore │ │          │ │          │   │    │
+│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘   │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    Tool Layer                           │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  Built-in Tools (14)    │  │  Extension Points    │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  Bash Read Glob Grep    │  │  • Tool interface    │  │    │
+│  │  │  Write Edit MultiEdit   │  │  • Registry.Register │  │    │
+│  │  │  LS WebFetch Todo×2     │  │  • MCP auto-import   │  │    │
+│  │  │  Agent SendMessage      │  │  • Custom CanUseTool │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  │                                                         │    │
+│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
+│  │  │  permissions/           │  │  mcp/                │  │    │
+│  │  │                         │  │                      │  │    │
+│  │  │  • 5-step chain         │  │  • StdioMCPClient    │  │    │
+│  │  │  • Rule matching        │  │  • JSON-RPC 2.0      │  │    │
+│  │  │  • Bash classifier      │  │  • Tool wrapper      │  │    │
+│  │  │  • Interactive prompt   │  │                      │  │    │
+│  │  └─────────────────────────┘  └──────────────────────┘  │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                types/  (wire format)                    │    │
+│  │                                                         │    │
+│  │  Message, ContentBlock (Text, ToolUse, ToolResult,      │    │
+│  │  Thinking, RedactedThinking, Image, Document),          │    │
+│  │  SDKMessage, Usage, APIError                            │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## What this implements
@@ -100,84 +175,6 @@ Interactive decisions ("always" / "never") are written back to session rules via
 | **Agent** | `tools/agent.go` | Spawns a subagent with independent query loop. |
 | **SendMessage** | `tools/agent.go` | Sends a follow-up prompt to a running subagent. |
 | **MCP tools** | `tools/mcp_tool.go` | Dynamically registered from MCP servers. |
-
----
-
-## SDK Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      User Application                           │
-│  (CLI app, API server, CI pipeline, Slack bot, etc.)            │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    go-claude-go SDK                              │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                  engine.QueryEngine                      │    │
-│  │                                                         │    │
-│  │  • SubmitMessage(ctx, prompt) → (msgCh, errCh)          │    │
-│  │  • GetAppState / SetAppState                            │    │
-│  │  • Messages() / TotalUsage()                            │    │
-│  │  • SessionID() / Resume from session                    │    │
-│  │  • Thinking / Caching / ToolChoice / Temperature        │    │
-│  └────────┬──────────────────────┬─────────────────────────┘    │
-│           │                      │                              │
-│     ┌─────▼──────┐        ┌─────▼──────────────┐               │
-│     │ query.Loop │        │ tools.RunTools      │               │
-│     │            │◄──────►│                     │               │
-│     │ • stream   │        │ • permission check  │               │
-│     │ • recover  │        │ • streaming exec    │               │
-│     │ • compact  │        │ • concurrent batch  │               │
-│     └─────┬──────┘        └────────┬────────────┘               │
-│           │                        │                            │
-│  ┌────────▼────────────────────────▼───────────────────────┐    │
-│  │              Infrastructure Layer                        │    │
-│  │                                                         │    │
-│  │  ┌──────────┐ ┌───────────┐ ┌──────────┐ ┌──────────┐  │    │
-│  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │  │    │
-│  │  │          │ │           │ │          │ │          │  │    │
-│  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │  │    │
-│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │ • Pre    │  │    │
-│  │  │ • Retry  │ │ • Auto    │ │ • Resume │ │ • Post   │  │    │
-│  │  │ • Think  │ │ • Budget  │ │          │ │ • Msg    │  │    │
-│  │  │ • Cache  │ │ • Restore │ │          │ │          │  │    │
-│  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                    Tool Layer                            │    │
-│  │                                                         │    │
-│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
-│  │  │  Built-in Tools (14)    │  │  Extension Points    │  │    │
-│  │  │                         │  │                      │  │    │
-│  │  │  Bash Read Glob Grep   │  │  • Tool interface    │  │    │
-│  │  │  Write Edit MultiEdit  │  │  • Registry.Register │  │    │
-│  │  │  LS WebFetch Todo×2    │  │  • MCP auto-import   │  │    │
-│  │  │  Agent SendMessage     │  │  • Custom CanUseTool │  │    │
-│  │  └─────────────────────────┘  └──────────────────────┘  │    │
-│  │                                                         │    │
-│  │  ┌─────────────────────────┐  ┌──────────────────────┐  │    │
-│  │  │  permissions/           │  │  mcp/                │  │    │
-│  │  │                         │  │                      │  │    │
-│  │  │  • 5-step chain         │  │  • StdioMCPClient   │  │    │
-│  │  │  • Rule matching        │  │  • JSON-RPC 2.0     │  │    │
-│  │  │  • Bash classifier      │  │  • Tool wrapper      │  │    │
-│  │  │  • Interactive prompt   │  │                      │  │    │
-│  │  └─────────────────────────┘  └──────────────────────┘  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                types/  (wire format)                      │    │
-│  │                                                         │    │
-│  │  Message, ContentBlock (Text, ToolUse, ToolResult,       │    │
-│  │  Thinking, RedactedThinking, Image, Document),           │    │
-│  │  SDKMessage, Usage, APIError                             │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
-```
 
 ### What is NOT in the SDK (application-layer concerns)
 
