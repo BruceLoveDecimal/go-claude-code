@@ -25,9 +25,17 @@ func HasPermissionsToUseTool(
 	ctx tools.ToolContext,
 	permCtx tools.ToolPermissionContext,
 ) (tools.PermissionResult, error) {
-	// ── 1. bypassPermissions → unconditional allow ────────────────────────
+	// ── 1. bypassPermissions → unconditional allow (with bash safety check) ──
 	if permCtx.Mode == tools.PermissionModeBypassPermissions {
-		return allow(input), nil
+		res := allow(input)
+		if toolName == "Bash" {
+			if cmd, _ := input["command"].(string); cmd != "" {
+				if c := ClassifyBash(cmd); c.IsDangerous {
+					res.Warning = c.Warning
+				}
+			}
+		}
+		return res, nil
 	}
 
 	path := extractPath(input)

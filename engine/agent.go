@@ -45,10 +45,18 @@ func (qe *QueryEngine) agentRunner() tools.AgentRunner {
 			MaxTurns:                qe.config.MaxTurns,
 			Verbose:                 qe.config.Verbose,
 			AutoCompact:             qe.config.AutoCompact,
+			RetryConfig:             qe.config.RetryConfig,
+			Hooks:                   qe.config.Hooks,
+			UserInputFn:             qe.config.UserInputFn,
 			GetAppState:             qe.GetAppState,
 			SetAppState:             qe.SetAppState,
 			ReadFileState:           qe.readFileState,
 			ContentReplacementState: qe.contentReplState,
+			// API feature parameters inherited from parent.
+			Thinking:                qe.config.Thinking,
+			Betas:                   qe.config.Betas,
+			Metadata:                qe.config.Metadata,
+			EnableCaching:           qe.config.EnableCaching,
 		}
 
 		terminal, err := query.Query(ctx, params, outCh)

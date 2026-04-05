@@ -29,6 +29,10 @@ type PermissionResult struct {
 	Behavior     PermissionBehavior
 	Reason       string
 	UpdatedInput map[string]interface{}
+	// Warning is a non-blocking safety message surfaced to the user as a
+	// side-channel system message (e.g. from the bash safety classifier).
+	// The tool is still executed when Warning is set.
+	Warning string
 }
 
 // PermissionMode controls how tool permission decisions are made for a session.
@@ -278,6 +282,11 @@ type ToolContext struct {
 	// Populated by engine.go; allows Agent and SendMessage tools to coordinate.
 	// May be nil in minimal / test configurations.
 	AgentRegistry *AgentRegistry
+
+	// UserInputFn is the callback used by AskUserQuestion to collect input from
+	// the user.  Nil in non-interactive or automated sessions — the tool will
+	// return an error to the model in that case.
+	UserInputFn UserInputFn
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

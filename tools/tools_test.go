@@ -46,7 +46,7 @@ func TestRunToolsChecksPermissionOnce(t *testing.T) {
 		ID:    "toolu_1",
 		Name:  "Count",
 		Input: []byte(`{}`),
-	}}, canUse, ToolContext{Registry: registry})
+	}}, canUse, ToolContext{Registry: registry}, nil, nil)
 	if err != nil {
 		t.Fatalf("RunTools() error = %v", err)
 	}

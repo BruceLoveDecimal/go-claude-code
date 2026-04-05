@@ -154,13 +154,21 @@ type AutoCompactConfig struct {
 // AutoCompactIfNeeded checks whether the message history exceeds the compaction
 // threshold and, if so, calls CompactConversation.  Returns (result, true) on
 // success or (nil, false) when compaction is not needed or fails.
+// AutoCompactResult wraps the CompactionResult and updated tracking state.
+type AutoCompactResult struct {
+	*CompactionResult
+	// UpdatedTracking is the tracking state after this compaction attempt.
+	// Callers should persist this for the next call.
+	UpdatedTracking *AutoCompactTrackingState
+}
+
 func AutoCompactIfNeeded(
 	ctx context.Context,
 	messages []types.Message,
 	cfg AutoCompactConfig,
 	tracking *AutoCompactTrackingState,
 ) (*CompactionResult, bool) {
-	// Circuit breaker
+	// Circuit breaker — stop trying after repeated failures.
 	if tracking != nil && tracking.ConsecutiveFailures >= MaxConsecutiveFailures {
 		return nil, false
 	}
@@ -173,7 +181,16 @@ func AutoCompactIfNeeded(
 
 	result, err := CompactConversation(ctx, messages, cfg)
 	if err != nil {
+		// Increment the circuit breaker counter on failure.
+		if tracking != nil {
+			tracking.ConsecutiveFailures++
+		}
 		return nil, false
+	}
+
+	// Reset consecutive failures on success.
+	if tracking != nil {
+		tracking.ConsecutiveFailures = 0
 	}
 	return result, true
 }
@@ -198,15 +215,10 @@ func CompactConversation(
 
 	preCount := EstimateTokenCount(messages)
 
-	// Preserve the last few messages verbatim so the model has recent context.
-	const tailSize = 5
-	var toSummarise, tail []types.Message
-	if len(messages) > tailSize {
-		toSummarise = messages[:len(messages)-tailSize]
-		tail = messages[len(messages)-tailSize:]
-	} else {
-		toSummarise = messages
-	}
+	// Preserve recent messages grouped by "API round" (assistant + following
+	// user messages).  This is more intelligent than a fixed tail size and
+	// mirrors the TS groupMessagesByApiRound() approach.
+	toSummarise, tail := splitByAPIRound(messages)
 
 	summaryModel := cfg.SummaryModel
 	if summaryModel == "" {
@@ -282,6 +294,142 @@ type summaryResponse struct {
 	} `json:"content"`
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// API round grouping for dynamic tail preservation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// apiRound is a group of messages forming one assistant turn: an
+// AssistantMessage followed by zero or more UserMessages (tool results).
+type apiRound struct {
+	messages []types.Message
+	tokens   int
+}
+
+// splitByAPIRound splits messages into (toSummarise, tail) where tail
+// contains the most recent complete API rounds, up to a token budget.
+// This replaces the fixed tailSize=5 approach with a dynamic grouping
+// strategy that mirrors the TS groupMessagesByApiRound().
+//
+// The budget for the tail is min(30% of total tokens, 20_000 tokens).
+// At minimum, the last round is always preserved.
+func splitByAPIRound(messages []types.Message) (toSummarise, tail []types.Message) {
+	if len(messages) == 0 {
+		return nil, nil
+	}
+
+	// Group messages into rounds.  A new round starts at each AssistantMessage.
+	var rounds []apiRound
+	var current apiRound
+
+	for _, msg := range messages {
+		if _, ok := msg.(*types.AssistantMessage); ok && len(current.messages) > 0 {
+			rounds = append(rounds, current)
+			current = apiRound{}
+		}
+		current.messages = append(current.messages, msg)
+		current.tokens += estimateMessageTokens(msg)
+	}
+	if len(current.messages) > 0 {
+		rounds = append(rounds, current)
+	}
+
+	if len(rounds) <= 1 {
+		// Only one round — summarise everything (summary prompt will still
+		// produce something useful).
+		return messages, nil
+	}
+
+	// Determine how many rounds to keep in the tail.
+	totalTokens := 0
+	for _, r := range rounds {
+		totalTokens += r.tokens
+	}
+
+	// Budget: min(30% of total, 20k tokens).
+	budget := totalTokens * 30 / 100
+	if budget > 20_000 {
+		budget = 20_000
+	}
+
+	// Walk backwards, greedily adding rounds while within budget.
+	tailStart := len(rounds)
+	tailTokens := 0
+	for i := len(rounds) - 1; i >= 0; i-- {
+		if tailTokens+rounds[i].tokens > budget && tailStart < len(rounds) {
+			break // already have at least one round, would exceed budget
+		}
+		tailTokens += rounds[i].tokens
+		tailStart = i
+	}
+
+	// Always keep at least the last round.
+	if tailStart >= len(rounds) {
+		tailStart = len(rounds) - 1
+	}
+
+	// Flatten rounds into message slices.
+	for _, r := range rounds[:tailStart] {
+		toSummarise = append(toSummarise, r.messages...)
+	}
+	for _, r := range rounds[tailStart:] {
+		tail = append(tail, r.messages...)
+	}
+
+	// If nothing to summarise (all messages are in tail), move the first
+	// round to the summarise side so we actually have something to compact.
+	if len(toSummarise) == 0 && len(rounds) > 1 {
+		toSummarise = rounds[0].messages
+		tail = nil
+		for _, r := range rounds[1:] {
+			tail = append(tail, r.messages...)
+		}
+	}
+
+	return toSummarise, tail
+}
+
+// compactSystemPrompt is the structured prompt sent to the summary model.
+// It mirrors the TS getCompactPrompt() in src/services/compact/prompt.ts.
+const compactSystemPrompt = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+- Tool calls will be REJECTED and waste your only turn — you will fail.
+
+You are a conversation summarizer. Your task is to create a detailed summary of the conversation so far. This summary will REPLACE the original conversation context, so include ALL information needed to continue the work.
+
+Your output must use the following format:
+
+<analysis>
+Analyze the conversation and extract information for each section below.
+</analysis>
+
+<summary>
+1. Primary Request and Intent:
+   [What the user originally asked for and their underlying goal]
+
+2. Key Technical Concepts:
+   [Important technical details, architecture decisions, patterns discussed]
+
+3. Files and Code Sections:
+   [ALL file paths mentioned, functions modified, code snippets that were written or discussed. Include FULL code for any significant implementations — these will be lost if not included here.]
+
+4. Errors and Fixes:
+   [Any errors encountered and how they were resolved]
+
+5. Problem Solving:
+   [Key decisions made, approaches tried, reasoning behind choices]
+
+6. All User Messages:
+   [Preserve the essential content of every user message, including corrections, preferences, and instructions]
+
+7. Pending Tasks:
+   [Any incomplete work, next steps mentioned, or tasks that were deferred]
+
+8. Current Work:
+   [What was being worked on at the end of the conversation, including the last action taken and its result]
+
+9. Optional Next Step:
+   [If the conversation suggests an obvious next action, note it here]
+</summary>`
+
 func callSummaryAPI(
 	ctx context.Context,
 	messages []types.Message,
@@ -291,7 +439,8 @@ func callSummaryAPI(
 		baseURL = "https://api.anthropic.com"
 	}
 
-	// Build a plain-text transcript of the messages to summarise.
+	// Build a structured transcript of the messages to summarise.
+	// Strip images/documents to avoid prompt-too-long on the summary call.
 	var sb strings.Builder
 	for _, msg := range messages {
 		switch m := msg.(type) {
@@ -299,32 +448,48 @@ func callSummaryAPI(
 			sb.WriteString("User: ")
 			if len(m.Msg.Content.Blocks) > 0 {
 				for _, blk := range m.Msg.Content.Blocks {
-					if tb, ok := blk.(*types.TextBlock); ok {
-						sb.WriteString(tb.Text)
-					} else if tr, ok := blk.(*types.ToolResultBlock); ok {
-						fmt.Fprintf(&sb, "[tool_result(%s): %s]", tr.ToolUseID, tr.Content)
+					switch b := blk.(type) {
+					case *types.TextBlock:
+						sb.WriteString(b.Text)
+					case *types.ToolResultBlock:
+						// Truncate very large tool results for the summary.
+						content := b.Content
+						if len(content) > 2000 {
+							content = content[:2000] + "... [truncated]"
+						}
+						fmt.Fprintf(&sb, "\n[tool_result(%s): %s]", b.ToolUseID, content)
+					case *types.ImageBlock:
+						sb.WriteString("[image omitted]")
+					case *types.DocumentBlock:
+						sb.WriteString("[document omitted]")
 					}
 				}
 			} else {
 				sb.WriteString(m.Msg.Content.Text)
 			}
-			sb.WriteString("\n")
+			sb.WriteString("\n\n")
 		case *types.AssistantMessage:
 			sb.WriteString("Assistant: ")
 			sb.WriteString(m.TextContent())
 			for _, blk := range m.Msg.Content {
-				if tb, ok := blk.(*types.ToolUseBlock); ok {
-					fmt.Fprintf(&sb, "[tool_use(%s, %s)]", tb.Name, string(tb.Input))
+				switch b := blk.(type) {
+				case *types.ToolUseBlock:
+					// Truncate large tool inputs.
+					input := string(b.Input)
+					if len(input) > 1000 {
+						input = input[:1000] + "..."
+					}
+					fmt.Fprintf(&sb, "\n[tool_use(%s): %s]", b.Name, input)
 				}
 			}
-			sb.WriteString("\n")
+			sb.WriteString("\n\n")
 		}
 	}
 
 	reqBody, err := json.Marshal(summaryRequest{
 		Model:     model,
-		MaxTokens: 4096,
-		System:    "You are a helpful assistant. Summarize the following conversation concisely, preserving all important context, decisions, tool outputs, and file paths. The summary will replace the original conversation, so include everything needed to continue the work.",
+		MaxTokens: 8192,
+		System:    compactSystemPrompt,
 		Messages: []summaryMessage{
 			{Role: "user", Content: "Please summarize this conversation:\n\n" + sb.String()},
 		},

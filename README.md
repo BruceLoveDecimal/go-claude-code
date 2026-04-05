@@ -2,7 +2,7 @@
 
 A Go Agent SDK modeled on the core engine of [Claude Code](https://github.com/anthropics/claude-code). Not a CLI clone — this is a library for Go developers to build their own agent applications.
 
-**~35 Go source files · ~6,000 lines · single binary · zero Node.js dependency**
+**~40 Go source files · ~7,500 lines · single binary · zero Node.js dependency**
 
 ## What this is
 
@@ -13,6 +13,8 @@ qe := engine.NewQueryEngine(engine.QueryEngineConfig{
     APIKey: "sk-ant-...",
     Model:  "claude-sonnet-4-6",
     CWD:    "/path/to/project",
+    Thinking: api.ThinkingConfig{Type: api.ThinkingTypeEnabled, BudgetTokens: 10000},
+    EnableCaching: true,
 })
 msgCh, errCh := qe.SubmitMessage(ctx, "Fix the failing test")
 for msg := range msgCh { /* stream to user */ }
@@ -26,19 +28,31 @@ Nine core modules, faithfully mirroring the TypeScript architecture:
 |--------|-----------|-------------------|
 | **QueryEngine** — stateful conversation manager, one instance per session | `engine/` | `src/QueryEngine.ts` |
 | **query() / AgentLoop** — the `while(true)` state machine that drives tool calls | `query/` | `src/query.ts` |
-| **Tool Orchestration** — concurrency-partitioned tool dispatch | `tools/` | `src/services/tools/toolOrchestration.ts` |
+| **Tool Orchestration** — concurrency-partitioned tool dispatch with streaming execution | `tools/` | `src/services/tools/toolOrchestration.ts` |
 | **Permission System** — 5-step permission decision chain + interactive CLI | `tools/permissions/` | `src/hooks/useCanUseTool.tsx` |
-| **Context Management** — four-layer compaction pipeline | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
+| **Context Management** — four-layer compaction pipeline with dynamic tail preservation | `compact/` + `tools/budgetcompact.go` | `src/services/compact/` |
 | **Stop Hooks** — post-response hook framework | `hooks/` | `src/hooks/` |
 | **Session Persistence** — JSONL conversation history with resume | `session/` | `src/utils/sessionStorage.ts` |
 | **MCP Client** — stdio JSON-RPC 2.0 with dynamic tool registration | `mcp/` | `src/services/mcp/` |
 | **Agent / Subagent** — nested agentic loops with coordinator pattern | `engine/agent.go` + `tools/agent.go` | `src/tools/AgentTool/` |
 
-### Permission System (Phase 2)
+### API features
+
+| Feature | Description |
+|---------|-------------|
+| **Extended Thinking** | Full support for `enabled` / `adaptive` / `disabled` modes with configurable `budget_tokens`. Thinking and redacted thinking blocks are parsed, streamed, and correctly stripped on model fallback. |
+| **Prompt Caching** | `EnableCaching` flag adds `cache_control: ephemeral` markers to the system prompt and last user message for reduced latency and cost. |
+| **Tool Choice** | `ToolChoice` parameter to force a specific tool (`tool`), allow any (`any`), or let the model decide (`auto`). |
+| **Temperature** | Configurable randomness (automatically omitted when thinking is enabled, per API requirements). |
+| **Beta Headers** | Dynamic `anthropic-beta` header assembly for any combination of beta features. |
+| **Request Metadata** | `user_id` field for request tracking and analytics. |
+| **Image / Document Blocks** | `ImageBlock` and `DocumentBlock` types for multimodal input (base64 images, PDFs). |
+
+### Permission System
 
 Five-step decision chain mirroring the TypeScript `hasPermissionsToUseTool()`:
 
-1. **bypassPermissions** mode → unconditional allow
+1. **bypassPermissions** mode → unconditional allow (with bash safety warnings)
 2. **AlwaysDenyRules** match → deny
 3. **AlwaysAllowRules** match → allow
 4. Tool `IsReadOnly()` + **dontAsk** / **acceptEdits** mode → allow
@@ -53,18 +67,19 @@ Interactive decisions ("always" / "never") are written back to session rules via
 | Layer | File | Behaviour |
 |-------|------|-----------|
 | **ToolResultBudget** | `tools/budgetcompact.go` | Caps total tool_result content at 250k chars; truncates oldest large results first. |
-| **AutoCompact** | `compact/autocompact.go` | Full conversation summarisation when context exceeds threshold. Circuit breaker after 3 failures. |
+| **AutoCompact** | `compact/autocompact.go` | Full conversation summarisation (9-section structured XML prompt) when context exceeds threshold. Circuit breaker after 3 consecutive failures. Dynamic tail preservation by API round grouping. Post-compact context restoration. |
 | **MicroCompact** | `compact/microcompact.go` | Deduplicates repeated `tool_result` blocks for the same `tool_use_id`. |
 | **Snip** | `compact/snip.go` | Pattern-based removal of redundant intermediate Bash/Grep/Glob outputs. |
 
-### Query Loop Control Flow (Phase 3)
+### Query Loop Control Flow
 
 | Feature | Behaviour |
 |---------|-----------|
-| **max_tokens recovery** | Detects `stop_reason == "max_tokens"` → injects continuation nudge (up to 3×) → escalates to 64k tokens |
+| **max_tokens recovery** | Detects `stop_reason == "max_tokens"` → escalates to 64k tokens first → then injects continuation nudge (up to 3×) with detailed anti-recap instructions |
 | **Fallback model** | Detects HTTP 529 / SSE `overloaded_error` → switches to `FallbackModel`, strips thinking block signatures |
+| **Streaming tool execution** | Tools start executing as their input JSON completes during model streaming, before the full response arrives. Reduces end-to-end latency. |
 | **ToolResult.NewMessages** | Side-channel messages from tools forwarded to output (UI) but not added to API history |
-| **Stop hooks** | `StopHookFn` runs after terminal responses; can trigger one more API round-trip |
+| **Stop hooks** | `StopHookFn` runs after terminal responses; can trigger one more API round-trip. Anti-death-spiral guard skips hooks on API error messages. |
 | **Permission denial tracking** | Every `PermBlock` recorded in `QueryEngine.PermissionDenials()` audit log |
 
 ### Built-in tools (14)
@@ -107,14 +122,15 @@ Interactive decisions ("always" / "never") are written back to session rules via
 │  │  • GetAppState / SetAppState                            │    │
 │  │  • Messages() / TotalUsage()                            │    │
 │  │  • SessionID() / Resume from session                    │    │
+│  │  • Thinking / Caching / ToolChoice / Temperature        │    │
 │  └────────┬──────────────────────┬─────────────────────────┘    │
 │           │                      │                              │
 │     ┌─────▼──────┐        ┌─────▼──────────────┐               │
 │     │ query.Loop │        │ tools.RunTools      │               │
 │     │            │◄──────►│                     │               │
 │     │ • stream   │        │ • permission check  │               │
-│     │ • recover  │        │ • concurrent batch  │               │
-│     │ • compact  │        │ • serial dispatch   │               │
+│     │ • recover  │        │ • streaming exec    │               │
+│     │ • compact  │        │ • concurrent batch  │               │
 │     └─────┬──────┘        └────────┬────────────┘               │
 │           │                        │                            │
 │  ┌────────▼────────────────────────▼───────────────────────┐    │
@@ -124,9 +140,10 @@ Interactive decisions ("always" / "never") are written back to session rules via
 │  │  │ api/     │ │ compact/  │ │ session/ │ │ hooks/   │  │    │
 │  │  │          │ │           │ │          │ │          │  │    │
 │  │  │ • Client │ │ • Snip    │ │ • JSONL  │ │ • Stop   │  │    │
-│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │          │  │    │
-│  │  │          │ │ • Auto    │ │ • Resume │ │          │  │    │
-│  │  │          │ │ • Budget  │ │          │ │          │  │    │
+│  │  │ • Stream │ │ • Micro   │ │ • Load   │ │ • Pre    │  │    │
+│  │  │ • Retry  │ │ • Auto    │ │ • Resume │ │ • Post   │  │    │
+│  │  │ • Think  │ │ • Budget  │ │          │ │ • Msg    │  │    │
+│  │  │ • Cache  │ │ • Restore │ │          │ │          │  │    │
 │  │  └──────────┘ └───────────┘ └──────────┘ └──────────┘  │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
@@ -147,15 +164,17 @@ Interactive decisions ("always" / "never") are written back to session rules via
 │  │  │                         │  │                      │  │    │
 │  │  │  • 5-step chain         │  │  • StdioMCPClient   │  │    │
 │  │  │  • Rule matching        │  │  • JSON-RPC 2.0     │  │    │
-│  │  │  • Interactive prompt   │  │  • Tool wrapper      │  │    │
+│  │  │  • Bash classifier      │  │  • Tool wrapper      │  │    │
+│  │  │  • Interactive prompt   │  │                      │  │    │
 │  │  └─────────────────────────┘  └──────────────────────┘  │    │
 │  └─────────────────────────────────────────────────────────┘    │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐    │
 │  │                types/  (wire format)                      │    │
 │  │                                                         │    │
-│  │  Message, ContentBlock, SDKMessage, Usage, APIError      │    │
-│  │  Marshal/Unmarshal (polymorphic JSON)                    │    │
+│  │  Message, ContentBlock (Text, ToolUse, ToolResult,       │    │
+│  │  Thinking, RedactedThinking, Image, Document),           │    │
+│  │  SDKMessage, Usage, APIError                             │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -171,8 +190,8 @@ go-claude-go/
 ├── main.go                  # Demo entry point
 ├── types/
 │   ├── message.go           # Message union + APIError (with IsOverloaded())
-│   ├── content.go           # ContentBlock union (Text, ToolUse, ToolResult, Thinking…)
-│   ├── events.go            # Terminal, StreamDeltaEvent
+│   ├── content.go           # ContentBlock union (Text, ToolUse, ToolResult, Thinking, Image, Document…)
+│   ├── events.go            # Terminal, StreamDeltaEvent, BlockCompleteEvent
 │   └── marshal.go           # Polymorphic JSON marshal/unmarshal
 ├── engine/
 │   ├── engine.go            # QueryEngine + session state + MCP registration
@@ -181,23 +200,34 @@ go-claude-go/
 ├── query/
 │   ├── query.go             # Query() entry point + QueryParams
 │   ├── state.go             # State struct + TransitionReason constants
-│   └── loop.go              # queryLoop() — max_tokens, fallback, stop hooks
+│   └── loop.go              # queryLoop() — max_tokens, fallback, stop hooks, streaming exec
 ├── api/
-│   ├── client.go            # Anthropic HTTP client (SSE)
-│   └── stream.go            # SSE assembler + error event handling
+│   ├── client.go            # Anthropic HTTP client (SSE, thinking, caching, betas)
+│   ├── stream.go            # SSE assembler + BlockCompleteEvent for streaming tool exec
+│   └── retry.go             # Exponential backoff with jitter
+├── prompt/
+│   └── builder.go           # Sectioned system prompt builder (env, tools, CLAUDE.md)
 ├── hooks/
-│   └── stop.go              # StopHookFn type definition
+│   └── hooks.go             # StopHookFn, PreToolHookFn, PostToolHookFn, MessageHookFn, HookSet
 ├── mcp/
 │   ├── types.go             # MCPTool, MCPResource, MCPContent, MCPServerConfig
 │   └── client.go            # StdioMCPClient: JSON-RPC 2.0 over stdio
 ├── session/
 │   ├── session.go           # SessionMeta, SessionFilePath, NewSessionID
 │   └── persist.go           # AppendMessages, LoadSession, ListSessions
+├── compact/
+│   ├── autocompact.go       # AutoCompact + 9-section XML prompt + dynamic tail + circuit breaker
+│   ├── microcompact.go      # MicroCompact: dedup tool_result by tool_use_id
+│   ├── snip.go              # Snip: remove redundant intermediate tool outputs
+│   ├── restore.go           # Post-compact context restoration
+│   └── tokenestimate.go     # Token estimation (chars/token heuristic)
 ├── tools/
 │   ├── tool.go              # Tool interface, AppState, PermissionContext…
 │   ├── registry.go          # Tool registry (name → Tool)
 │   ├── orchestration.go     # RunTools(): partition + dispatch + side messages
+│   ├── streaming_executor.go # StreamingToolExecutor: start tools during model streaming
 │   ├── budgetcompact.go     # ApplyToolResultBudget(): 250k char cap
+│   ├── askuser.go           # AskUserQuestion tool (via UserInputFn)
 │   ├── agent.go             # AgentTool + SendMessageTool
 │   ├── agent_registry.go    # AgentRegistry for subagent coordination
 │   ├── mcp_tool.go          # MCPToolWrapper: adapts MCP tools to Tool interface
@@ -205,12 +235,11 @@ go-claude-go/
 │   ├── write.go / edit.go / multiedit.go / todo.go
 │   ├── permissions/
 │   │   ├── permissions.go   # 5-step decision chain
-│   │   └── interactive.go   # CLI prompt [y/n/a/N] + rule write-back
+│   │   ├── interactive.go   # CLI prompt [y/n/a/N] + rule write-back
+│   │   └── bash_classifier.go # 18-pattern dangerous command detector
 │   └── tools_test.go
 └── compact/
-    ├── autocompact.go       # AutoCompact + token estimation + circuit breaker
-    ├── microcompact.go      # MicroCompact: dedup tool_result by tool_use_id
-    └── snip.go              # Snip: remove redundant intermediate tool outputs
+    └── (see above)
 ```
 
 ### Key design mappings: TypeScript → Go
@@ -220,9 +249,11 @@ go-claude-go/
 | `async function*` (AsyncGenerator) | `chan types.Message` + goroutine |
 | `while (true)` + `{ ...state, field: val }` | `for {}` loop with explicit `State` struct |
 | `Promise.all()` for concurrent tools | `sync.WaitGroup` + goroutines |
+| `StreamingToolExecutor` | `tools.StreamingToolExecutor` + `BlockCompleteEvent` |
 | `AbortController` / `AbortSignal` | `context.WithCancel` (per-turn) |
 | React `setState(fn)` for AppState | `SetAppState(func(AppState) AppState)` callback |
 | `hasPermissionsToUseTool()` hook | `permissions.HasPermissionsToUseTool()` 5-step chain |
+| `BetaWebSearchTool`, `ThinkingConfig` | `api.ThinkingConfig`, `api.ToolChoice` structs |
 | Zod schema (`z.object(...)`) | `map[string]interface{}` JSON Schema |
 | `FallbackTriggeredError` | `APIError.IsOverloaded()` → model switch |
 
@@ -247,6 +278,7 @@ import (
     "context"
     "fmt"
 
+    "github.com/claude-code/go-claude-go/api"
     "github.com/claude-code/go-claude-go/engine"
     "github.com/claude-code/go-claude-go/types"
 )
@@ -255,10 +287,16 @@ func main() {
     qe := engine.NewQueryEngine(engine.QueryEngineConfig{
         APIKey:        "sk-ant-...",
         Model:         "claude-sonnet-4-6",
-        FallbackModel: "claude-haiku-4-5-20251001", // optional
+        FallbackModel: "claude-haiku-4-5-20251001",
         CWD:           "/your/project",
         MaxTurns:      10,
         SystemPrompt:  "You are a helpful coding assistant.",
+        // Extended thinking with 10k token budget
+        Thinking:      api.ThinkingConfig{Type: api.ThinkingTypeEnabled, BudgetTokens: 10000},
+        // Enable prompt caching for reduced latency
+        EnableCaching: true,
+        // Beta features
+        Betas:         []string{"prompt-caching-2024-07-31"},
     })
 
     msgCh, errCh := qe.SubmitMessage(context.Background(),
@@ -271,11 +309,6 @@ func main() {
     }
     if err := <-errCh; err != nil {
         panic(err)
-    }
-
-    // Check permission denials
-    for _, d := range qe.PermissionDenials() {
-        fmt.Printf("denied: %s — %s\n", d.ToolName, d.Reason)
     }
 }
 ```
@@ -328,28 +361,29 @@ SubmitMessage(prompt)
         ├─ compact.ApplySnipIfNeeded()
         ├─ compact.ApplyMicroCompact()
         ├─ compact.AutoCompactIfNeeded()       ← if > threshold
+        │    └─ post-compact context restore
         │
-        ├─ api.StreamMessage()                 ← POST /v1/messages (SSE)
+        ├─ api.StreamMessageWithRetry()        ← POST /v1/messages (SSE)
+        │    ├─ yield StreamDeltaEvent
+        │    ├─ yield BlockCompleteEvent        ← triggers streaming tool exec
         │    └─ yield AssistantMessage
         │
         ├─ error? ─┬─ 413 → reactive compact + retry
-        │           └─ 529 → switch to FallbackModel + retry
+        │           ├─ 529 → switch to FallbackModel + retry
+        │           └─ 429/5xx → exponential backoff retry
         │
         ├─ stop_reason == "max_tokens"?
-        │    ├─ count < 3 → inject nudge + retry
-        │    └─ count ≥ 3 → escalate to 64k tokens
+        │    ├─ not escalated → escalate to 64k tokens
+        │    ├─ count < 3 → inject continuation nudge + retry
+        │    └─ count ≥ 3 → return max_output_tokens_exhausted
         │
-        ├─ no tool_use? ─┬─ run StopHooks
+        ├─ no tool_use? ─┬─ run StopHooks (skip if API error msg)
         │                 ├─ ShouldRetry? → continue
         │                 └─ return Terminal{Reason: "completed"}
         │
-        ├─ permissions.HasPermissionsToUseTool()
-        │    └─ PermAsk? → PromptForPermission() [y/n/a/N]
-        │
-        ├─ tools.RunTools()
-        │    ├─ partitionByConcurrency()
-        │    ├─ concurrent batch → goroutines (WaitGroup)
-        │    ├─ serial batch    → sequential
+        ├─ StreamingToolExecutor.Finish()
+        │    ├─ concurrent-safe tools already running
+        │    ├─ sequential tools executed now
         │    └─ sideMessages → outCh (UI only)
         │
         └─ state.Messages += [assistant, tool_results]
@@ -376,15 +410,27 @@ No Anthropic SDK dependency — the API client is implemented directly using `ne
 |-----------|--------|
 | QueryEngine + session state | ✅ Complete |
 | query() / AgentLoop (max_tokens, fallback, hooks) | ✅ Complete |
+| Extended Thinking (enabled/adaptive, budget_tokens, redacted) | ✅ Complete |
+| Prompt Caching (cache_control on system + messages) | ✅ Complete |
+| API parameters (tool_choice, temperature, betas, metadata) | ✅ Complete |
+| Image / Document content blocks | ✅ Complete |
+| Streaming tool execution (BlockCompleteEvent) | ✅ Complete |
 | Permission system (5-step chain + interactive CLI) | ✅ Complete |
+| Bash safety classifier (18 dangerous patterns) | ✅ Complete |
 | Tool concurrency partitioning + side messages | ✅ Complete |
 | Tool-result budget compaction | ✅ Complete |
-| AutoCompact / MicroCompact / Snip | ✅ Complete |
+| AutoCompact (structured XML prompt, dynamic tail, circuit breaker) | ✅ Complete |
+| MicroCompact / Snip | ✅ Complete |
+| Post-compact context restoration | ✅ Complete |
+| System prompt builder (env detection, CLAUDE.md, tools) | ✅ Complete |
+| API retry with exponential backoff + jitter | ✅ Complete |
+| Hooks (Pre/Post-tool, Message, Stop with anti-death-spiral) | ✅ Complete |
+| AskUserQuestion tool (via UserInputFn) | ✅ Complete |
+| Token estimation + budget check | ✅ Complete |
 | Bash / Read / Glob / Grep / LS / WebFetch tools | ✅ Complete |
 | Write / Edit / MultiEdit tools | ✅ Complete |
 | TodoRead / TodoWrite tools | ✅ Complete |
 | SSE streaming + error event handling | ✅ Complete |
-| Thinking blocks | ✅ Parsed + stripped on model switch |
 | Session persistence (JSONL) + resume | ✅ Complete |
 | MCP client (stdio JSON-RPC) + tool wrapper | ✅ Complete |
 | Agent / SendMessage + subagent coordination | ✅ Complete |
@@ -393,26 +439,7 @@ No Anthropic SDK dependency — the API client is implemented directly using `ne
 
 ## Roadmap
 
-The SDK is functional today. Below are the three priority tiers for reaching production-grade quality.
-
-### P0 — Agent behavior correctness
-
-| Item | Description |
-|------|-------------|
-| **System prompt builder** | Sectioned builder with environment detection (OS, shell, CWD, git branch, date), dynamic tool description injection, and CLAUDE.md project directive loading. This is the single highest-impact missing piece — without it the model has no environmental awareness. |
-| **API retry** | Exponential backoff for 429/529/5xx with configurable `maxRetries` and jitter. Without retry the SDK is unusable under real API load. |
-| **Bash safety classifier** | Dangerous command pattern library (rm -rf, DROP TABLE, git push --force, etc.) that acts as a safety net even under `bypassPermissions` mode. |
-
-### P1 — Agent interaction quality
-
-| Item | Description |
-|------|-------------|
-| **Hooks expansion** | `PreToolHook`, `PostToolHook`, `MessageHook` with unified `HookFn` interface — the core extension mechanism for SDK users to inject audit, filtering, or rewriting logic without modifying engine code. |
-| **AskUserQuestion tool** | Via `QueryEngineConfig.UserInputFn` callback. SDK users inject their own IO implementation (CLI stdin, web form, Slack bot, etc.). Without this, the model cannot ask for clarification. |
-| **Token estimation + budget** | Accurate token counting, pre-request budget check, proactive compact trigger instead of waiting for 413 errors. |
-| **CLAUDE.md + project context** | Recursive search for `.claude/CLAUDE.md` and `CLAUDE.md` from CWD up to git root, merged into system prompt. |
-
-### P2 — Ecosystem
+The SDK core is feature-complete. Remaining work focuses on ecosystem and production hardening:
 
 | Item | Description |
 |------|-------------|

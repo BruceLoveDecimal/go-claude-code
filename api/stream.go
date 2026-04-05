@@ -50,10 +50,11 @@ type sseMessage struct {
 }
 
 type sseContentBlock struct {
-	Type  string          `json:"type"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Text  string          `json:"text,omitempty"`
+	Type  string `json:"type"`
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Text  string `json:"text,omitempty"`
+	Data  string `json:"data,omitempty"` // redacted_thinking opaque blob
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,10 +71,11 @@ type streamAssembler struct {
 	usage      types.Usage
 
 	// Per-block accumulators keyed by block index
-	textBlocks    map[int]*textAccum
-	toolUseBlocks map[int]*toolAccum
-	thinkingBlocks map[int]*thinkingAccum
-	blockOrder    []int // insertion order for deterministic output
+	textBlocks            map[int]*textAccum
+	toolUseBlocks         map[int]*toolAccum
+	thinkingBlocks        map[int]*thinkingAccum
+	redactedThinkingBlocks map[int]*redactedThinkingAccum
+	blockOrder            []int // insertion order for deterministic output
 }
 
 type textAccum struct {
@@ -90,19 +92,24 @@ type thinkingAccum struct {
 	thinking string
 }
 
+type redactedThinkingAccum struct {
+	data string
+}
+
 func newStreamAssembler() *streamAssembler {
 	return &streamAssembler{
-		textBlocks:    make(map[int]*textAccum),
-		toolUseBlocks: make(map[int]*toolAccum),
-		thinkingBlocks: make(map[int]*thinkingAccum),
+		textBlocks:             make(map[int]*textAccum),
+		toolUseBlocks:          make(map[int]*toolAccum),
+		thinkingBlocks:         make(map[int]*thinkingAccum),
+		redactedThinkingBlocks: make(map[int]*redactedThinkingAccum),
 	}
 }
 
 // applyEvent updates internal state for one parsed SSE event.
 // Returns (deltaMsg, isComplete) where deltaMsg is non-nil when there's an
-// incremental update worth propagating and isComplete is true when the
-// message is fully assembled.
-func (a *streamAssembler) applyEvent(ev sseEvent) (deltaMsg *types.StreamDeltaEvent, isComplete bool) {
+// incremental update worth propagating (StreamDeltaEvent or BlockCompleteEvent)
+// and isComplete is true when the message is fully assembled.
+func (a *streamAssembler) applyEvent(ev sseEvent) (deltaMsg interface{}, isComplete bool) {
 	switch ev.Type {
 	case "message_start":
 		if ev.Message != nil {
@@ -129,6 +136,8 @@ func (a *streamAssembler) applyEvent(ev sseEvent) (deltaMsg *types.StreamDeltaEv
 			}
 		case "thinking":
 			a.thinkingBlocks[idx] = &thinkingAccum{thinking: ev.ContentBlock.Text}
+		case "redacted_thinking":
+			a.redactedThinkingBlocks[idx] = &redactedThinkingAccum{data: ev.ContentBlock.Data}
 		}
 
 	case "content_block_delta":
@@ -161,6 +170,28 @@ func (a *streamAssembler) applyEvent(ev sseEvent) (deltaMsg *types.StreamDeltaEv
 			if acc, ok := a.thinkingBlocks[idx]; ok {
 				acc.thinking += ev.Delta.Thinking
 			}
+		}
+
+	case "content_block_stop":
+		// Emit a BlockCompleteEvent so the streaming tool executor can start
+		// executing completed tool_use blocks before the full response.
+		idx := ev.Index
+		if acc, ok := a.toolUseBlocks[idx]; ok {
+			inputJSON := acc.inputBuffer.String()
+			if inputJSON == "" {
+				inputJSON = "{}"
+			}
+			block := &types.ToolUseBlock{
+				Type:  types.ContentTypeToolUse,
+				ID:    acc.id,
+				Name:  acc.name,
+				Input: json.RawMessage(inputJSON),
+			}
+			return &types.BlockCompleteEvent{
+				Type:         "block_complete",
+				Index:        idx,
+				ToolUseBlock: block,
+			}, false
 		}
 
 	case "message_delta":
@@ -199,6 +230,11 @@ func (a *streamAssembler) build() *types.AssistantMessage {
 			content = append(content, &types.ThinkingBlock{
 				Type:     types.ContentTypeThinking,
 				Thinking: acc.thinking,
+			})
+		} else if acc, ok := a.redactedThinkingBlocks[idx]; ok {
+			content = append(content, &types.RedactedThinkingBlock{
+				Type: types.ContentTypeRedacted,
+				Data: acc.data,
 			})
 		}
 	}

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/claude-code/go-claude-go/hooks"
 	"github.com/claude-code/go-claude-go/types"
 	"github.com/google/uuid"
 )
@@ -81,9 +82,11 @@ func partitionByConcurrency(
 //     using goroutines.
 //   - All other blocks are executed serially within their batch.
 func RunTools(
-	blocks     []*types.ToolUseBlock,
-	canUse     CanUseToolFn,
-	toolCtx    ToolContext,
+	blocks        []*types.ToolUseBlock,
+	canUse        CanUseToolFn,
+	toolCtx       ToolContext,
+	preHooks      []hooks.PreToolHookFn,
+	postHooks     []hooks.PostToolHookFn,
 ) (toolResults []types.Message, sideMessages []types.Message, err error) {
 	if len(blocks) == 0 {
 		return nil, nil, nil
@@ -94,7 +97,7 @@ func RunTools(
 
 	for _, batch := range batches {
 		if batch.concurrent {
-			results, sides, batchErr := runConcurrently(batch.blocks, canUse, toolCtx)
+			results, sides, batchErr := runConcurrently(batch.blocks, canUse, toolCtx, preHooks, postHooks)
 			if batchErr != nil {
 				return nil, nil, batchErr
 			}
@@ -102,7 +105,7 @@ func RunTools(
 			sideMessages = append(sideMessages, sides...)
 		} else {
 			for _, block := range batch.blocks {
-				msgs, singleErr := runSingleTool(block, canUse, toolCtx)
+				msgs, singleErr := runSingleTool(block, canUse, toolCtx, preHooks, postHooks)
 				if singleErr != nil {
 					return nil, nil, singleErr
 				}
@@ -127,9 +130,11 @@ type indexedResult struct {
 }
 
 func runConcurrently(
-	blocks  []*types.ToolUseBlock,
-	canUse  CanUseToolFn,
-	toolCtx ToolContext,
+	blocks     []*types.ToolUseBlock,
+	canUse     CanUseToolFn,
+	toolCtx    ToolContext,
+	preHooks   []hooks.PreToolHookFn,
+	postHooks  []hooks.PostToolHookFn,
 ) (toolResults []types.Message, sideMessages []types.Message, err error) {
 	out := make([][]types.Message, len(blocks))
 	ch := make(chan indexedResult, len(blocks))
@@ -139,7 +144,7 @@ func runConcurrently(
 		wg.Add(1)
 		go func(idx int, b *types.ToolUseBlock) {
 			defer wg.Done()
-			msgs, runErr := runSingleTool(b, canUse, toolCtx)
+			msgs, runErr := runSingleTool(b, canUse, toolCtx, preHooks, postHooks)
 			ch <- indexedResult{index: idx, msgs: msgs, err: runErr}
 		}(i, block)
 	}
@@ -170,9 +175,11 @@ func runConcurrently(
 // runSingleTool returns a slice where [0] is the tool_result message and
 // [1:] are any side-channel messages from ToolResult.NewMessages.
 func runSingleTool(
-	block   *types.ToolUseBlock,
-	canUse  CanUseToolFn,
-	toolCtx ToolContext,
+	block     *types.ToolUseBlock,
+	canUse    CanUseToolFn,
+	toolCtx   ToolContext,
+	preHooks  []hooks.PreToolHookFn,
+	postHooks []hooks.PostToolHookFn,
 ) ([]types.Message, error) {
 	registry := toolCtx.Registry
 
@@ -203,14 +210,38 @@ func runSingleTool(
 		input = perm.UpdatedInput
 	}
 
+	// Surface bash safety warnings as side messages (non-blocking).
+	var warnMsgs []types.Message
+	if perm.Warning != "" {
+		warnMsgs = append(warnMsgs, makeWarnMessage(perm.Warning))
+	}
+
+	// Pre-tool hooks
+	for _, h := range preHooks {
+		if hookErr := h(toolCtx.Ctx, tool.Name(), input); hookErr != nil {
+			return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("pre-tool hook: %v", hookErr))}, nil
+		}
+	}
+
 	// Execute
 	result, err := tool.Call(input, toolCtx, canUse, nil)
 	if err != nil {
 		return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("tool error: %v", err))}, nil
 	}
 
+	// Post-tool hooks
+	postResult := hooks.PostToolResult{Data: result.Data, IsError: result.IsError}
+	for _, h := range postHooks {
+		if hookErr := h(toolCtx.Ctx, tool.Name(), input, postResult); hookErr != nil {
+			return []types.Message{makeErrorResult(block.ID, fmt.Sprintf("post-tool hook: %v", hookErr))}, nil
+		}
+	}
+
 	msgs := []types.Message{makeToolResultMessage(block.ID, result)}
 	msgs = append(msgs, result.NewMessages...)
+	// Prepend any safety warnings as side messages (index 0 = tool_result
+	// must stay first; warnings go after it as additional side messages).
+	msgs = append(msgs, warnMsgs...)
 	return msgs, nil
 }
 
@@ -255,4 +286,14 @@ func makeErrorResult(toolUseID, errMsg string) types.Message {
 		Data:    errMsg,
 		IsError: true,
 	})
+}
+
+func makeWarnMessage(warning string) types.Message {
+	return &types.SystemMessage{
+		Type:    types.MessageTypeSystem,
+		UUID:    uuid.New().String(),
+		Subtype: types.SystemSubtypeInformational,
+		Content: "⚠ " + warning,
+		Level:   types.SystemLevelWarning,
+	}
 }

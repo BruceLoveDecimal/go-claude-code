@@ -24,6 +24,16 @@ type StreamDeltaEvent struct {
 	Thinking   string `json:"thinking,omitempty"`
 }
 
+// BlockCompleteEvent is emitted when a content block is fully streamed
+// (content_block_stop).  Used by the streaming tool executor to start
+// executing tools before the full response is assembled.
+type BlockCompleteEvent struct {
+	Type  string `json:"type"` // "block_complete"
+	Index int    `json:"index"`
+	// ToolUseBlock is non-nil when the completed block was a tool_use.
+	ToolUseBlock *ToolUseBlock `json:"tool_use_block,omitempty"`
+}
+
 // SDKMessage is the union of everything that SubmitMessage can yield to callers.
 // In Go we use an empty interface so the stream can carry both persistent
 // conversation messages and transient SDK events like deltas/request markers.
